@@ -9,8 +9,8 @@
         <version>1.0-SNAPSHOT</version>
     </parent>
 
-    <groupId>com.salesforce.einstein.ds</groupId>
-    <artifactId>ds</artifactId>
+    <groupId>com.salesforce.einstein.scheduler</groupId>
+    <artifactId>scheduler</artifactId>
 
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
@@ -18,4 +18,18 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
+    <dependencies>
+        <dependency>
+            <groupId>com.salesforce.einstein.ds</groupId>
+            <artifactId>ds</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <!-- Multi-VM tests: an embedded SQL database shared by several schedulers -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <version>2.2.224</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
 </project>
