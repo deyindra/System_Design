@@ -52,9 +52,15 @@ class IndexedPriorityQueueTest {
         assertEquals(sorted, list);
     }
 
+    @SuppressWarnings("ConstantValue")
     @Test
     void emptyQueue() {
+        // Empty it via add/poll rather than asserting on a fresh instance: that also covers the
+        // drained state, and a fresh one only gives IntelliJ "always true/false" assertions.
         IndexedPriorityQueue<Integer> q = new IndexedPriorityQueue<>();
+        q.add(1);
+        assertEquals(1, q.poll());
+
         assertTrue(q.isEmpty());
         assertEquals(0, q.size());
         assertNull(q.peek());
@@ -93,8 +99,9 @@ class IndexedPriorityQueueTest {
     @Test
     void rejectsNonComparableWithoutComparator() {
         IndexedPriorityQueue<Object> q = new IndexedPriorityQueue<>();
+        q.add(1);
         assertThrows(ClassCastException.class, () -> q.offer(new Object()));
-        assertTrue(q.isEmpty());
+        assertEquals(List.of(1), drain(q)); // rejected before touching the heap
     }
 
     @Test
@@ -105,7 +112,9 @@ class IndexedPriorityQueueTest {
         assertTrue(q.remove(30));
         assertFalse(q.contains(30));
         assertFalse(q.remove(30));
-        assertFalse(q.contains("not an integer"));
+        Object notAnInteger = "not an integer"; // contains(Object) must tolerate foreign types
+        //noinspection SuspiciousMethodCalls
+        assertFalse(q.contains(notAnInteger));
         assertEquals(List.of(10, 20, 40, 50), drain(q));
     }
 
@@ -195,9 +204,8 @@ class IndexedPriorityQueueTest {
         IndexedPriorityQueue<Integer> q = new IndexedPriorityQueue<>();
         q.addAll(List.of(3, 1, 2));
         q.clear();
-        assertTrue(q.isEmpty());
-        assertFalse(q.contains(1));
         q.add(7);
+        assertFalse(q.contains(1)); // index was cleared, not just the heap
         assertEquals(List.of(7), drain(q));
     }
 
@@ -207,8 +215,7 @@ class IndexedPriorityQueueTest {
         List<Integer> values = List.of(9, 4, 7, 1, 8, 2, 2, 6);
         q.addAll(values);
 
-        List<Integer> seen = new ArrayList<>();
-        for (Integer v : q) seen.add(v);
+        List<Integer> seen = new ArrayList<>(q); // copies via AbstractCollection.toArray -> iterator()
         Collections.sort(seen);
         List<Integer> expected = new ArrayList<>(values);
         Collections.sort(expected);
