@@ -307,6 +307,111 @@ class IndexedPriorityQueueTest {
         assertEquals(expected, drained);
     }
 
+    /** Equal by {@code group}, ordered by a mutable priority: copies of one group share a node set. */
+    private static final class Copy {
+        final int group;
+        int priority;
+
+        Copy(int group, int priority) {
+            this.group = group;
+            this.priority = priority;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof Copy && ((Copy) o).group == group;
+        }
+
+        @Override
+        public int hashCode() {
+            return group;
+        }
+    }
+
+    @Test
+    void updateOfSeveralEqualCopiesKeepsHeapOrder() {
+        // Many small groups of equal copies, some copies changing per update. Re-sifting the copies
+        // one by one fails this: each sift compares against copies that are still out of place.
+        for (int seed = 0; seed < 200; seed++) {
+            Random rnd = new Random(seed);
+            IndexedPriorityQueue<Copy> q = new IndexedPriorityQueue<>(Comparator.comparingInt(c -> c.priority));
+            List<Copy> all = new ArrayList<>();
+            for (int i = 0; i < 300; i++) {
+                Copy c = new Copy(rnd.nextInt(100), rnd.nextInt(50));
+                all.add(c);
+                q.add(c);
+            }
+            for (int op = 0; op < 50; op++) {
+                int group = all.get(rnd.nextInt(all.size())).group;
+                for (Copy c : all) if (c.group == group && rnd.nextBoolean()) c.priority = rnd.nextInt(50);
+                assertTrue(q.update(new Copy(group, -1)));
+            }
+            assertDrainsInOrder(q, all.size(), "seed " + seed);
+        }
+    }
+
+    @Test
+    void updateOfManyEqualCopiesRebuildsTheHeap() {
+        // 200 copies in 400 elements: re-sifting would cost more than a rebuild, so update heapifies.
+        Random rnd = new Random(7);
+        IndexedPriorityQueue<Copy> q = new IndexedPriorityQueue<>(Comparator.comparingInt(c -> c.priority));
+        List<Copy> group = new ArrayList<>();
+        for (int i = 0; i < 400; i++) {
+            Copy c = new Copy(i < 200 ? 0 : i, rnd.nextInt(1000));
+            if (i < 200) group.add(c);
+            q.add(c);
+        }
+        for (int round = 0; round < 20; round++) {
+            for (Copy c : group) c.priority = rnd.nextInt(1000);
+            assertTrue(q.update(new Copy(0, -1)));
+        }
+        assertDrainsInOrder(q, 400, "rebuild");
+    }
+
+    @Test
+    void updateOfCopiesWhenTheEarlierCopySitsBelowTheLaterOne() {
+        // kid2 is offered first, so update visits it first, but kid1 sifts above it. Marking every
+        // copy pending before floating any strands kid2 below a normal node; the pops then take ana.
+        IndexedPriorityQueue<Copy> q = new IndexedPriorityQueue<>(Comparator.comparingInt(c -> c.priority));
+        Copy ana = new Copy(1, 1), ben = new Copy(2, 4), cy = new Copy(3, 9), dee = new Copy(4, 7);
+        Copy eli = new Copy(5, 10), fay = new Copy(6, 11), gus = new Copy(7, 12);
+        Copy kid2 = new Copy(0, 6), kid1 = new Copy(0, 5);
+        Collections.addAll(q, ana, ben, cy, kid2, dee, eli, fay, kid1, gus);
+        // heap: ana, ben, cy, kid1, dee, eli, fay, kid2, gus (kid2 is kid1's child)
+
+        kid1.priority = 2;
+        kid2.priority = 3;
+        assertTrue(q.update(kid1));
+
+        List<Copy> expected = List.of(ana, kid1, kid2, ben, dee, cy, eli, fay, gus);
+        List<Copy> drained = drain(q);
+        assertEquals(expected.size(), drained.size());
+        for (int i = 0; i < expected.size(); i++) assertSame(expected.get(i), drained.get(i), "position " + i);
+    }
+
+    private static void assertDrainsInOrder(IndexedPriorityQueue<Copy> q, int size, String label) {
+        List<Copy> drained = drain(q);
+        assertEquals(size, drained.size(), label);
+        for (int i = 1; i < drained.size(); i++) {
+            assertTrue(drained.get(i - 1).priority <= drained.get(i).priority, label + ", out of order at " + i);
+        }
+    }
+
+    @Test
+    void iteratorRemoveOfReplayedElementRemovesThatInstance() {
+        IndexedPriorityQueue<Integer> q = new IndexedPriorityQueue<>();
+        Collections.addAll(q, 0, 10, 1, 11, 12, 2, 3);   // a valid heap, kept as is by offer
+        List<Integer> seen = new ArrayList<>();
+        for (Iterator<Integer> it = q.iterator(); it.hasNext(); ) {
+            Integer e = it.next();
+            seen.add(e);
+            if (e == 11 || e == 3) it.remove();           // removing 11 moves 3 above the cursor; 3 is replayed
+        }
+        Collections.sort(seen);
+        assertEquals(List.of(0, 1, 2, 3, 10, 11, 12), seen);
+        assertEquals(List.of(0, 1, 2, 10, 12), drain(q));
+    }
+
     @Test
     void randomizedUpdatesKeepHeapOrder() {
         Random rnd = new Random(99);

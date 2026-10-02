@@ -8,7 +8,6 @@ import java.util.ConcurrentModificationException;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
@@ -18,25 +17,42 @@ import java.util.Set;
  * O(log N) {@link #remove(Object)}, O(1) {@link #contains(Object)} and an
  * {@link #update(Object)} operation for re-keying an element in place.
  *
- * <p>Duplicates (per {@code equals}) are allowed; equal elements share one position set
- * (a {@link LinkedHashSet}, so slot bookkeeping and picking a slot are O(1)). Costs are
- * expected-time given a reasonable {@code hashCode}:
+ * <p>Each heap slot holds a small node that records its own index, so sifting is pure array
+ * work. The {@code HashMap} index (element -> nodes) is touched only when an element enters or
+ * leaves the queue, once per operation rather than once per sift step.
+ *
+ * <p>Duplicates (per {@code equals}) are allowed; equal elements share one node set (a
+ * {@link LinkedHashSet}, so adding, removing and picking a node are O(1)). Costs, where
+ * "+ hash" is one expected-O(1) {@code HashMap} operation given a reasonable {@code hashCode}:
  * <ul>
- *   <li>{@code offer}, {@code poll}, {@code remove(Object)}: O(log N), regardless of duplicates</li>
- *   <li>{@code peek}, {@code contains}: O(1)</li>
- *   <li>{@code update}: O(log N) for a unique element; O(k log N + k²) with k equal copies</li>
+ *   <li>{@code offer}, {@code poll}, {@code remove(Object)}: O(log N) + hash, regardless of duplicates</li>
+ *   <li>{@code peek}: O(1); {@code contains}: hash</li>
+ *   <li>{@code update}: O(log N) + hash for a unique element; O(min(k log N, N)) + hash with k
+ *       equal copies (it rebuilds the heap once re-sifting every copy would cost more)</li>
  * </ul>
  *
  * <p><b>Key-stability contract:</b> {@code equals}/{@code hashCode} of an element must not
  * change while it is in the queue. Its priority (what the comparator looks at) may change,
- * as long as {@link #update(Object)} is called after wards.
+ * as long as {@link #update(Object)} is called afterwards.
  *
  * <p>Not thread-safe. Null elements are not permitted.
  */
 public class IndexedPriorityQueue<T> extends AbstractQueue<T> {
-    private final ArrayList<T> heap = new ArrayList<>();
-    // element -> every heap slot holding an equal element; a key is present iff its set is non-empty
-    private final Map<T, Set<Integer>> positionMap = new HashMap<>();
+    /** One heap slot. Identity equality, so equal elements still get distinct nodes. */
+    private static final class Node<T> {
+        final T value;
+        int index;
+        boolean pending;   // only during a multi-copy update: orders before every other node
+
+        Node(T value, int index) {
+            this.value = value;
+            this.index = index;
+        }
+    }
+
+    private final ArrayList<Node<T>> heap = new ArrayList<>();
+    // element -> the node of every equal element in the queue; a key is present iff its set is non-empty
+    private final Map<T, Set<Node<T>>> nodesByValue = new HashMap<>();
     private final Comparator<? super T> comparator;
 
     // concurrent modification detector
@@ -57,7 +73,7 @@ public class IndexedPriorityQueue<T> extends AbstractQueue<T> {
 
     @Override
     public boolean contains(Object o) {
-        return positionsOf(o) != null;
+        return nodesOf(o) != null;
     }
 
     @Override
@@ -68,62 +84,105 @@ public class IndexedPriorityQueue<T> extends AbstractQueue<T> {
         }
 
         modCount++;
-        heap.add(element);
-        int index = heap.size() - 1;
-        addIndexMapping(element, index);
-        siftUp(index);
+        Node<T> node = new Node<>(element, heap.size());
+        heap.add(node);
+        nodesByValue.computeIfAbsent(element, k -> new LinkedHashSet<>()).add(node);
+        siftUp(node.index);
         return true;
     }
 
     @Override
     public T peek() {
-        return heap.isEmpty() ? null : heap.get(0);
+        return heap.isEmpty() ? null : heap.get(0).value;
     }
 
     @Override
     public T poll() {
         if (heap.isEmpty()) return null;
-        T root = heap.get(0);
+        T root = heap.get(0).value;
         removeAt(0);
         return root;
     }
 
     @Override
     public boolean remove(Object o) {
-        Set<Integer> indices = positionsOf(o);
-        if (indices == null) return false;
-        // Any slot will do since the copies are equal. LinkedHashSet hands back its oldest
+        Set<Node<T>> nodes = nodesOf(o);
+        if (nodes == null) return false;
+        // Any node will do since the copies are equal. LinkedHashSet hands back its oldest
         // entry in O(1) (a plain HashSet would scan buckets, which degrades after removals).
-        removeAt(indices.iterator().next());
+        removeAt(nodes.iterator().next().index);
         return true;
     }
 
     /**
-     * O(log N) for a uniquely-keyed element. Restores the heap ordering after an
-     * element's priority has changed (see the key-stability contract on the class).
+     * Restores the heap ordering after an element's priority has changed (see the
+     * key-stability contract on the class). Every equal copy is re-sifted, since each may
+     * have a new priority: O(log N) for a unique element, O(min(k log N, N)) for k copies.
      *
      * @return {@code false} if no equal element is in the queue
      */
     public boolean update(T element) {
-        Set<Integer> indices = positionMap.get(element);
-        if (indices == null) return false;
+        Set<Node<T>> nodes = nodesByValue.get(element);
+        if (nodes == null) return false;
         modCount++;
-        // Equal elements share one position set and sifting reshuffles it, so snapshot the
-        // instances first and re-locate each one by identity before sifting it.
-        List<T> instances = new ArrayList<>(indices.size());
-        for (int i : indices) instances.add(heap.get(i));
-        for (T instance : instances) {
-            int index = indexOfInstance(instance);
+        int k = nodes.size();
+        int n = heap.size();
+        if (k == 1) {
+            int index = nodes.iterator().next().index;
             if (siftDown(index) == index) siftUp(index);
+        } else if ((long) k * log2(n) >= n) {
+            heapify();
+        } else {
+            reinsert(nodes);
         }
         return true;
+    }
+
+    /**
+     * Re-keys several changed nodes in O(k log N). Sifting them one by one is not enough: each
+     * sift would compare against copies that are still out of place, and could settle relative
+     * to a priority that is about to move. So no comparison reads a changed priority until
+     * every changed node is out of the heap:
+     * <ol>
+     *   <li>mark each node pending (smaller than anything) and float it up; the pending nodes
+     *       end up as a connected region around the root, and the rest is a valid heap</li>
+     *   <li>pop the k pending nodes off the top</li>
+     *   <li>offer them again with their new priorities</li>
+     * </ol>
+     * The heap array is touched, the element index is not: the same nodes stay in the queue.
+     */
+    private void reinsert(Set<Node<T>> nodes) {
+        // Mark and float one node at a time. An unmarked copy is passed like any other node, so
+        // each floated node ends up at the root or under another pending one. Marking them all
+        // first can strand a pending node under a normal one, and the pops below would then
+        // remove the wrong nodes.
+        for (Node<T> node : nodes) {
+            node.pending = true;
+            siftUp(node.index);
+        }
+        int k = nodes.size();
+        for (int i = 0; i < k; i++) {
+            int last = heap.size() - 1;
+            Node<T> tail = heap.remove(last);
+            if (last > 0) {
+                heap.set(0, tail);
+                tail.index = 0;
+                siftDown(0);
+            }
+        }
+        for (Node<T> node : nodes) {
+            node.pending = false;
+            node.index = heap.size();
+            heap.add(node);
+            siftUp(node.index);
+        }
     }
 
     @Override
     public void clear() {
         modCount++;
         heap.clear();
-        positionMap.clear();
+        nodesByValue.clear();
     }
 
     @Override
@@ -137,12 +196,12 @@ public class IndexedPriorityQueue<T> extends AbstractQueue<T> {
         private int expectedModCount = modCount;
 
         /**
-         * Elements that were relocated by a preceding {@code remove()} from a not-yet-visited
+         * Nodes that were relocated by a preceding {@code remove()} from a not-yet-visited
          * slot to an already-visited one; they would otherwise be skipped, so we replay them
          * after the array is exhausted (same technique as {@link java.util.PriorityQueue}).
          */
-        private ArrayDeque<T> forgetMeNot = null;
-        private T lastRetElt = null;
+        private ArrayDeque<Node<T>> forgetMeNot = null;
+        private Node<T> lastRetNode = null;
 
         @Override
         public boolean hasNext() {
@@ -153,14 +212,14 @@ public class IndexedPriorityQueue<T> extends AbstractQueue<T> {
         public T next() {
             if (expectedModCount != modCount) throw new ConcurrentModificationException();
             if (cursor < heap.size()) {
-                lastRetElt = null;
+                lastRetNode = null;
                 lastRet = cursor;
-                return heap.get(cursor++);
+                return heap.get(cursor++).value;
             }
             if (forgetMeNot != null && !forgetMeNot.isEmpty()) {
                 lastRet = -1;
-                lastRetElt = forgetMeNot.poll();
-                return lastRetElt;
+                lastRetNode = forgetMeNot.poll();
+                return lastRetNode.value;
             }
             throw new NoSuchElementException();
         }
@@ -169,7 +228,7 @@ public class IndexedPriorityQueue<T> extends AbstractQueue<T> {
         public void remove() {
             if (expectedModCount != modCount) throw new ConcurrentModificationException();
             if (lastRet >= 0) {
-                T moved = removeAt(lastRet);
+                Node<T> moved = removeAt(lastRet);
                 lastRet = -1;
                 if (moved == null) {
                     cursor--; // the tail element filled this slot; revisit it
@@ -177,9 +236,9 @@ public class IndexedPriorityQueue<T> extends AbstractQueue<T> {
                     if (forgetMeNot == null) forgetMeNot = new ArrayDeque<>();
                     forgetMeNot.add(moved); // swam past the cursor; replay later
                 }
-            } else if (lastRetElt != null) {
-                removeAt(indexOfInstance(lastRetElt));
-                lastRetElt = null;
+            } else if (lastRetNode != null) {
+                removeAt(lastRetNode.index);
+                lastRetNode = null;
             } else {
                 throw new IllegalStateException();
             }
@@ -188,124 +247,101 @@ public class IndexedPriorityQueue<T> extends AbstractQueue<T> {
     }
 
     /**
-     * Removes the element at {@code index} by filling the hole with the tail element.
+     * Removes the node at {@code index} by filling the hole with the tail node.
      *
-     * @return the tail element if it ended up <em>above</em> {@code index} (so an in-order
+     * @return the tail node if it ended up <em>above</em> {@code index} (so an in-order
      *         iterator would skip it), otherwise {@code null}
      */
-    private T removeAt(int index) {
+    private Node<T> removeAt(int index) {
         modCount++;
+        Node<T> removed = heap.get(index);
+        Set<Node<T>> nodes = nodesByValue.get(removed.value);
+        nodes.remove(removed);
+        if (nodes.isEmpty()) nodesByValue.remove(removed.value);
+
         int last = heap.size() - 1;
-        removeIndexMapping(heap.get(index), index);
-        T moved = heap.remove(last);
+        Node<T> moved = heap.remove(last);
         if (index == last) return null;
 
-        removeIndexMapping(moved, last);
         heap.set(index, moved);
-        addIndexMapping(moved, index);
-
+        moved.index = index;
         int newIndex = siftDown(index);
         if (newIndex == index) newIndex = siftUp(index);
         return newIndex < index ? moved : null;
     }
 
     /**
-     * Position set for an arbitrary {@code Object}, or {@code null} if absent. The Collection
+     * Node set for an arbitrary {@code Object}, or {@code null} if absent. The Collection
      * contract makes {@code contains}/{@code remove} take {@code Object}; looking it up in a
      * {@code T}-keyed map is safe because HashMap only uses {@code equals}/{@code hashCode}
      * (a non-{@code T} simply misses), whereas casting to {@code T} would be an unchecked lie.
      */
     @SuppressWarnings("SuspiciousMethodCalls")
-    private Set<Integer> positionsOf(Object o) {
-        return o == null ? null : positionMap.get(o);
+    private Set<Node<T>> nodesOf(Object o) {
+        return o == null ? null : nodesByValue.get(o);
     }
 
-    /** Index of this exact instance (by identity), or -1. */
-    private int indexOfInstance(T target) {
-        Set<Integer> indices = positionMap.get(target);
-        if (indices != null) {
-            for (int i : indices) {
-                if (heap.get(i) == target) return i;
-            }
-        }
-        return -1;
+    /** Floyd's bottom-up heap construction, O(N). */
+    private void heapify() {
+        for (int i = (heap.size() >>> 1) - 1; i >= 0; i--) siftDown(i);
+    }
+
+    /** floor(log2(n)) + 1 for n > 0: the height of a heap of n elements. */
+    private static int log2(int n) {
+        return 32 - Integer.numberOfLeadingZeros(n);
     }
 
     /*
-     * Both sifts move a "hole" rather than swapping: the sifted element is detached from its
-     * position set up front, displaced elements are shifted one level, and the element is
-     * re-attached once at its final slot. This also stays correct when the element shares a
-     * position set with an equal neighbor.
-     *
-     * The set may be momentarily empty while the element is detached; it is deliberately left
-     * in positionMap (rather than via removeIndexMapping) to avoid a remove/re-create per sift.
+     * Both sifts move a "hole" rather than swapping: displaced nodes are shifted one level (each
+     * recording its new index), and the sifted node is written once at its final slot.
      */
 
-    /** @return the element's final index */
+    /** @return the node's final index */
     private int siftUp(int index) {
-        T element = heap.get(index);
-        Set<Integer> slots = positionMap.get(element);
-        slots.remove(index);
+        Node<T> node = heap.get(index);
         while (index > 0) {
             int parentIndex = (index - 1) >>> 1;
-            if (compare(element, heap.get(parentIndex)) >= 0) break;
-            move(parentIndex, index);
+            Node<T> parent = heap.get(parentIndex);
+            if (compare(node, parent) >= 0) break;
+            heap.set(index, parent);
+            parent.index = index;
             index = parentIndex;
         }
-        heap.set(index, element);
-        slots.add(index);
+        heap.set(index, node);
+        node.index = index;
         return index;
     }
 
-    /** @return the element's final index */
+    /** @return the node's final index */
     private int siftDown(int index) {
         int size = heap.size();
         int half = size >>> 1;
-        T element = heap.get(index);
-        Set<Integer> slots = positionMap.get(element);
-        slots.remove(index);
+        Node<T> node = heap.get(index);
         while (index < half) {
             int childIndex = (index << 1) + 1;
+            Node<T> child = heap.get(childIndex);
             int rightIndex = childIndex + 1;
-            if (rightIndex < size && compare(heap.get(rightIndex), heap.get(childIndex)) < 0) {
+            if (rightIndex < size && compare(heap.get(rightIndex), child) < 0) {
                 childIndex = rightIndex;
+                child = heap.get(rightIndex);
             }
-            if (compare(element, heap.get(childIndex)) <= 0) break;
-            move(childIndex, index);
+            if (compare(node, child) <= 0) break;
+            heap.set(index, child);
+            child.index = index;
             index = childIndex;
         }
-        heap.set(index, element);
-        slots.add(index);
+        heap.set(index, node);
+        node.index = index;
         return index;
     }
 
-    private void move(int from, int to) {
-        T element = heap.get(from);
-        heap.set(to, element);
-        Set<Integer> slots = positionMap.get(element);
-        slots.remove(from);
-        slots.add(to);
-    }
-
-    private void addIndexMapping(T element, int index) {
-        positionMap.computeIfAbsent(element, k -> new LinkedHashSet<>()).add(index);
-    }
-
-    private void removeIndexMapping(T element, int index) {
-        Set<Integer> indices = positionMap.get(element);
-        if (indices != null) {
-            indices.remove(index);
-            if (indices.isEmpty()) {
-                positionMap.remove(element);
-            }
-        }
-    }
-
+    /** Pending nodes (see {@link #reinsert}) order before all others; otherwise by value. */
     @SuppressWarnings("unchecked")
-    private int compare(T a, T b) {
+    private int compare(Node<T> a, Node<T> b) {
+        if (a.pending || b.pending) return a.pending == b.pending ? 0 : a.pending ? -1 : 1;
         if (comparator != null) {
-            return comparator.compare(a, b);
+            return comparator.compare(a.value, b.value);
         }
-        return ((Comparable<? super T>) a).compareTo(b);
+        return ((Comparable<? super T>) a.value).compareTo(b.value);
     }
 }
