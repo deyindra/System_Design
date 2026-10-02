@@ -108,63 +108,50 @@ Layers ① and ② are the same classes in both modes. Layer ③ is the one choi
 
 ```mermaid
 flowchart TB
-    APP(["Application code: Runnables, JobHandlers, TaskHandle callers"])
+    APP(["Application code<br/>Runnables · JobHandlers · TaskHandle callers"])
 
-    subgraph CORE["① scheduler core, identical in both modes"]
-        direction TB
-        subgraph API["API"]
-            direction TB
-            JS["JobScheduler + Builder"]
-            TH["TaskHandle"]
-            SS["SchedulerStats"]
-        end
-        subgraph ENG["Engine"]
-            direction TB
-            DSP["Dispatcher"]
-            POOL["TaskPool"]
-            WD["TimeoutWatchdog"]
-        end
-        SW{{"Mode switch<br/>store.isShared()"}}
-    end
-
-    subgraph SPIP["② spi package: the contract between engine and storage"]
+    subgraph CORE["① Scheduler core: the same classes in both modes"]
         direction LR
-        SPI[["«interface» TaskStore"]]
+        JS["JobScheduler<br/>+ Builder"]
+        DSP["Dispatcher<br/>1 thread"]
+        POOL["TaskPool<br/>poolSize workers"]
+        WD["TimeoutWatchdog<br/>1 thread"]
+        TH["TaskHandle<br/>SchedulerStats"]
+        SW{{"Mode switch<br/>store.isShared()"}}
+        JS --> DSP --> POOL --> WD
+        JS --> TH
+        SW -.->|"reaper and polling<br/>on or off"| DSP
+    end
+
+    subgraph SPIP["② SPI: the contract between engine and storage"]
+        direction LR
+        SPI[["«interface» TaskStore<br/>insert · claimDue · finish · reapExpiredLeases<br/>remove · reschedule · takeOutcomes"]]
         TT["TaskTransitions<br/>shared state machine"]
-        VT["TaskRecord · TaskSpec · Outcome<br/>FinishResult · RemoveResult"]
+        VT["TaskRecord · TaskSpec<br/>Outcome · FinishResult"]
+        SPI --- TT
+        SPI --- VT
     end
 
-    subgraph FV["③ Future stores, separate modules"]
-        FUT["QuartzTaskStore<br/>ZkTaskStore · …"]
+    subgraph STORES["③ Store: the one component you choose"]
+        direction TB
+        MEM["<b>Single node</b><br/>InMemoryTaskStore<br/>isShared = false<br/>IPQs + outbox, one lock"]
+        JDBC["<b>Multi node</b><br/>JdbcTaskStore<br/>isShared = true<br/>claim · lease · fencing · outbox"]
+        FUT["<b>Future</b><br/>QuartzTaskStore<br/>ZkTaskStore · …"]
     end
 
-    subgraph MV["③ Multi node store"]
-            JDBC["JdbcTaskStore<br/>isShared = true<br/>claim · lease · fencing · outbox"]
-            DB[("Shared database<br/>6 sched_* tables")]
-            JDBC <-->|JDBC| DB
-        end
-    subgraph SV["③ Single node store"]
-            MEM["InMemoryTaskStore<br/>isShared = false<br/>IPQs + local outbox, one lock"]
-        end
-    APP -->|"submit · remove · reschedule · getStats · shutdown"| JS
-    JS --> TH & SS
-    JS --> DSP --> POOL --> WD
-    SW -.->|"turns reaper and polling on or off"| DSP
-    JS ==>|"insert · remove · reschedule"| SPI
-    DSP ==>|"claimDue · reap · takeOutcomes"| SPI
-    POOL ==>|finish| SPI
-    SPI --- TT
-    SPI --- VT
-    SPI -.->|"implemented by"| FUT
-    SPI -.->|"implemented by"| JDBC
-    SPI -.->|"implemented by"| MEM
+    DB[("Shared database<br/>6 sched_* tables<br/>multi node only")]
+
+    APP -->|"submit · remove · reschedule · getStats · shutdown"| CORE
+    CORE ==>|"every read and write of task state"| SPIP
+    SPIP -.->|"implemented by"| STORES
+    JDBC <-->|JDBC| DB
 
     classDef same fill:#e8f1ff,stroke:#3b6fd8,color:#0b2a66
     classDef spi fill:#f3e8ff,stroke:#7e3bd8,color:#2e0b66
     classDef single fill:#e6f7e9,stroke:#2f9e44,color:#0b3d17
     classDef multi fill:#fff4d6,stroke:#d89a00,color:#4a3400
     classDef future fill:#f1f3f5,stroke:#868e96,stroke-dasharray: 4 3,color:#343a40
-    class JS,TH,SS,DSP,POOL,WD,SW same
+    class JS,TH,DSP,POOL,WD,SW same
     class SPI,TT,VT spi
     class MEM single
     class JDBC,DB multi
@@ -361,45 +348,35 @@ classDiagram
 ## 6. Task lifecycle
 
 ```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> SCHEDULED: submit
-
-    state "Live: counts toward maxTasks" as LIVE {
-        SCHEDULED --> RUNNING: claim
-        RUNNING --> SCHEDULED: recurring run ends
-        RUNNING --> BLACKLISTED: timeout limit reached
-    }
-
-    state "Terminal: removed, outcome sent to the submitter" as END {
-        COMPLETED
-        CANCELLED
-    }
-
-    RUNNING --> COMPLETED: one-time run ends
-    RUNNING --> CANCELLED: dropped at run end
-    SCHEDULED --> CANCELLED: remove
-    BLACKLISTED --> CANCELLED: remove
-
-    note left of SCHEDULED
-        reschedule keeps it
-        SCHEDULED, new time
-    end note
-
-    COMPLETED --> [*]
-    CANCELLED --> [*]
+flowchart LR
+    START(("submit")) --> S
+    S(["SCHEDULED<br/>waiting for its run time<br/><i>reschedule: new time, stays here</i>"]) -->|"claim<br/>version +1"| R(["RUNNING<br/>on one worker, one node"])
+    R -->|"recurring run ends<br/>next = nextAfter(finish)"| S
+    R -->|"timeout streak<br/>reaches the limit"| B(["BLACKLISTED<br/>parked, never runs"])
+    R -->|"one-time run ends<br/>any result"| C(["COMPLETED"])
+    R -->|"recurring task<br/>dropped at run end"| X(["CANCELLED"])
+    S -->|"remove"| X
+    B -->|"remove"| X
+    C --> FIN(("end"))
+    X --> FIN
 
     classDef pending fill:#e8f1ff,stroke:#3b6fd8,color:#0b2a66
     classDef active fill:#fff4d6,stroke:#d89a00,color:#4a3400
     classDef parked fill:#ffe3e3,stroke:#c92a2a,color:#5c0b0b
     classDef done fill:#e6f7e9,stroke:#2f9e44,color:#0b3d17
     classDef gone fill:#eeeeee,stroke:#868e96,color:#343a40
-    class SCHEDULED pending
-    class RUNNING active
-    class BLACKLISTED parked
-    class COMPLETED done
-    class CANCELLED gone
+    classDef term fill:#343a40,stroke:#343a40,color:#ffffff
+    class S pending
+    class R active
+    class B parked
+    class C done
+    class X gone
+    class START,FIN term
 ```
+
+**Key:** blue, yellow and red are **live** states: the task is in the store and counts toward
+`maxTasks` (a blacklisted task too, until it is removed). Green and grey are **terminal**: the task
+is removed and its outcome goes to the submitting node.
 
 The states and rules are the same in both modes, because both stores use `TaskTransitions`. What
 differs is **what triggers** each transition and **where the state is kept**.
