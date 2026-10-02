@@ -9,7 +9,7 @@ package com.salesforce.einstein.scheduler.spi;
 public record RemoveResult(Kind kind, TaskRecord after, Outcome outcome) {
     public enum Kind {
         NOT_FOUND,
-        /** Was SCHEDULED: cancelled immediately. */
+        /** Was SCHEDULED: canceled immediately. */
         CANCELLED,
         /** Was RUNNING: flagged, dropped when the run ends. */
         DEFERRED,
