@@ -199,7 +199,7 @@ event path: the outbox row commits with the data, the relay publishes it in orde
 consumer below Kafka is derived and can be rebuilt. **Dotted arrows** are the search read barrier
 and the one explicitly eventual read (trending).
 
-### 4.2 The three request paths
+### 4.2 The four request paths
 
 ```mermaid
 %%{init: {"themeVariables": {"fontSize": "20px"}, "sequence": {"actorMargin": 80, "messageMargin": 45, "boxMargin": 15}}}%%
@@ -231,8 +231,16 @@ sequenceDiagram
   S-->>P: 200 (always current)
   end
 
+  rect rgb(245, 238, 255)
+  Note over P,DB: READ: entities of a tag, paged (inverted B-tree)
+  P->>S: GET /tags/{bug}/entities?cursor=1200&limit=50
+  S->>DB: tag live? · ix_entity_tags_by_tag range<br/>tag_id = bug AND entity_seq > 1200 ORDER BY entity_seq LIMIT 51
+  DB-->>S: 51 index entries (no sort, no OFFSET)
+  S-->>P: 200 page of 50 + next cursor (always current)
+  end
+
   rect rgb(255, 248, 230)
-  Note over P,I: SEARCH: bug AND p1 AND NOT done
+  Note over P,I: SEARCH: bug AND p1 AND NOT done (RoaringBitmaps, B-tree fallback)
   DB-)K: relay publishes seq 9001 (≈ 50 ms later)
   K-)I: apply, watermark = 9001
   P->>S: POST /search {all:[bug,p1], none:[done]}
@@ -241,7 +249,7 @@ sequenceDiagram
     S->>I: AND / ANDNOT bitmaps (~1 ms)
     S->>DB: resolve the page's 50 entity refs
   else still behind after 50 ms
-    S->>DB: SQL search on the primary
+    S->>DB: SQL over the inverted B-tree on the primary (exact, slower)
   end
   S-->>P: 200 page + total
   end
@@ -300,7 +308,7 @@ erDiagram
   TAGS ||--|{ TAG_USAGE : "16 counter buckets"
   OUTBOX }o--|| OUTBOX_RELAY_STATE : "relayed up to last_seq"
   ENTITY_TAGS ||--|| IX_ENTITY_TAGS_BY_TAG : "same rows, sorted by tag (same txn)"
-  IX_ENTITY_TAGS_BY_TAG ||--o| ROARING_INDEX : "rebuilt from; then fed by outbox"
+  ENTITY_TAGS ||--o| ROARING_INDEX : "bootstrapped by a scan; then fed by outbox"
   ENTITIES ||--o{ ROARING_INDEX : "entity_seq = bit position"
 
   IX_ENTITY_TAGS_BY_TAG {
@@ -427,7 +435,7 @@ inverted index, exactly what a search engine keeps (term → sorted doc ids).
 | Tier | Lives in | Serves | Updated | Consistency |
 |---|---|---|---|---|
 | ① Forward index (PK of `entity_tags`) | Shard primary | Q1 tags of an entity | Write transaction | Exact |
-| ② Inverted B-tree `ix_entity_tags_by_tag` | Shard primary, same table | Q2 entities of a tag; Q3 SQL fallback; source for rebuilding ③ | Write transaction | Exact |
+| ② Inverted B-tree `ix_entity_tags_by_tag` | Shard primary, same table | Q2 entities of a tag; Q3 SQL fallback when ③ is behind | Write transaction | Exact |
 | ③ RoaringBitmap index | Memory of every pod (whales on dedicated index pods) | Q3 boolean search | Outbox → Kafka, ms behind | Used only behind the read barrier |
 
 ```mermaid
@@ -470,8 +478,32 @@ flowchart LR
 | Updated | In the write transaction | In the write transaction | From outbox events via Kafka |
 | Consistency | Exact | Exact | Used only if watermark ≥ barrier |
 | Cost of `bug`(5M) AND `p1`(2M) AND NOT `done`(3M) | n/a | reads ~10M postings, ~450 MB: **seconds** | 2–30 MB of bitmaps: **~1 ms**, `total` count for free |
-| Rebuilt from | n/a | n/a | snapshot scan of ② + the event stream |
+| Rebuilt from | n/a | n/a | snapshot scan of the tenant's `entity_tags` rows + the event stream |
 | Without it | n/a | full tenant scan per lookup | seconds per search, load on the primary |
+
+**B-tree inverted index vs RoaringBitmap inverted index.** Both are "tag → list of entities".
+They differ in how the list is stored, and that decides what each is fast at:
+
+| | ② B-tree inverted index | ③ RoaringBitmap inverted index |
+|---|---|---|
+| Posting list stored as | Sorted index entries `(tenant_id, tag_id, entity_seq)`, ~45 B each, in Postgres pages | Compressed sets of 32-bit integers in RAM: arrays for sparse chunks, 8 KB bitmaps for dense ones, runs for ranges; ~0.1–2 B per posting |
+| Fast at | **One tag, in order, a page at a time**: page 3 of `bug` reads 51 entries | **Combining whole lists**: AND / OR / ANDNOT and counts over millions of postings |
+| Slow at | Combining big lists: a boolean query reads every posting of every term | Paging by anything except the integer; it isn't durable (it's a copy) |
+| Keys | Any type | Integers only, hence `entity_seq` |
+| Freshness | Exact: same transaction as the row | Milliseconds behind: trusted only when watermark ≥ read barrier |
+| Endpoint | `GET /v1/tags/{tagId}/entities`; `POST /v1/search` fallback | `POST /v1/search` |
+
+**Where they are in the code:**
+
+| Piece | Code |
+|---|---|
+| ② index definition | `db/migration/postgresql/V1__init.sql`: `CREATE INDEX ix_entity_tags_by_tag ON entity_tags (tenant_id, tag_id, entity_seq)` |
+| ② entities of a tag, keyset pages | `TagController.entities` → `TagSearchService.entitiesOf` → `JdbcTagStore.entitiesOf` (`tag_id = :tag AND entity_seq > :after ORDER BY entity_seq LIMIT`) |
+| ② boolean fallback in SQL | `TagSearchService.search` → `JdbcTagStore.search` (`GROUP BY … HAVING COUNT(*)`, `EXISTS`, `NOT EXISTS`); `served_by=store` |
+| ③ bitmaps, query and watermark | `RoaringInvertedIndex.search` / `watermark`; `served_by=index` |
+| ③ fed by events | `RoaringInvertedIndex` as an event listener (outbox → Kafka or in-process) |
+| ③ bootstrap | `RoaringInvertedIndex` → `TagReader.scanAssignments` (snapshot scan of the tenant's `entity_tags`) |
+| Read barrier that picks ③ or ② | `TagSearchService.search`: `TagReader.latestSeq` vs `idx.watermark`, wait ≤ 50 ms |
 
 **Alternatives, and why not:**
 
@@ -535,6 +567,7 @@ protocol-compatible managed service. The code uses only JDBC/PostgreSQL SQL and 
 | HA and failover | **Patroni or CloudNativePG**, sync quorum `ANY 1 (b, c)` | Leader lease and fencing: no split brain, RPO 0, RTO < 60 s | Async replicas (lose acked writes) | Same on any Kubernetes |
 | Connection pooling | **PgBouncer** | 800 client connections → ~200 server connections | Larger `max_connections` | Sidecar or Deployment |
 | Event stream | **Apache Kafka** + transactional outbox | Per-tenant order (key = tenant), replay, many consumer groups | SQS/SNS, Pub/Sub (proprietary); dual write (loses events) | MSK / Confluent / Strimzi |
+| Entities of a tag; exact inverted index | **PostgreSQL B-tree** `ix_entity_tags_by_tag (tenant_id, tag_id, entity_seq)` | Maintained in the write transaction, so it's exact and strong; keyset pages in entity order with no sort; the fallback for boolean search | Full tenant scan (no index); GIN over a `tags[]` column (write amplification); OpenSearch (lag) | Any PostgreSQL |
 | Boolean search | **RoaringBitmap** (Java, in-process) | Compressed set algebra in ~1 ms; exact watermark; memory bounded per tenant | SQL joins (seconds); OpenSearch (lag, can't prove freshness); GIN (write amplification) | In the pod |
 | Product full-text search | **OpenSearch** (downstream of Kafka) | Text + facets for product UIs, where ~1 s lag is fine | Elasticsearch licence; cloud search services | Amazon OpenSearch / self-managed |
 | Trending | **PostgreSQL** (own small database) | Exactly-once counts in one transaction; a range scan answers "top 24 h" | Flink + Elasticsearch (a cluster for a `GROUP BY`); Redis ZSETs (no exactly-once) | Any PostgreSQL |
