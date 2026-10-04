@@ -24,7 +24,7 @@ Bitbucket pull requests) **create tags, attach them to entities, and search by t
 their entities; we store only references `(entity_type, entity_id)`.
 
 **The scale.** 300k tenants, 4 B tagged entities, 20 B assignments, 300k reads/s and 30k writes/s at
-peak. A few whale tenants hold 50M+ entities each.
+peak. A few *whale* tenants (the very largest customers, thousands of times an average one) hold 50M+ entities each.
 
 **The hard requirement.** **Strong consistency for every read and write by default**: once a write
 is acknowledged, every reader on every pod sees it. The service must also run on **AWS and GCP**,
@@ -89,7 +89,7 @@ approval workflows (see [§7](#7-future-enhancements)).
 
 | Input | Value | Note |
 |---|---|---|
-| Tenants | 300k | whales have 50M+ entities |
+| Tenants | 300k | a typical tenant has ~13k entities; *whales*, the few largest tenants, have 50M+ |
 | Tagged entities | 4 B | ~13k per tenant on average |
 | Assignments | **20 B** | ~5 tags per entity |
 | Tags | 300M | ~1k per tenant, cap 10k |
@@ -135,7 +135,143 @@ approval workflows (see [§7](#7-future-enhancements)).
 
 ## 4. High-level architecture
 
-### 4.1 The whole system
+### 4.1 One view per use case
+
+Draw these one at a time on the whiteboard, in this order, and then put them together as the big
+picture in [§4.2](#42-the-big-picture). Each view shows only the boxes that use case touches.
+
+| View | Use case | Boxes it adds |
+|---|---|---|
+| A | Write: attach, detach, replace tags | ingress, pods, router, shard primary, sync standby |
+| B | Read: tags of an entity, entities of a tag | the forward PK and the inverted B-tree on the primary |
+| C | Boolean search: `bug AND p1 AND NOT done` | RoaringBitmap index in every pod, read barrier |
+| D | Propagate changes | outbox, relay, Kafka, index applier, purge job, product search |
+| E | Trending and analytics | trending aggregator, trend store, analytics sink, ClickHouse |
+| F | Survive a zone failure | Patroni / CloudNativePG, standbys in three zones |
+
+#### A. Write: attach tags to an entity
+
+```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 60, "rankSpacing": 70, "padding": 20}, "themeVariables": {"fontSize": "22px"}}}%%
+flowchart LR
+  P["<b>Product</b><br/>POST /entities/jira:issue/42<br/>/tags:attach"]
+  GW["<b>Envoy</b><br/>verify JWT<br/>→ X-Tenant-Id"]
+  POD["<b>Tagging pod</b><br/>TenantIsolation: rate limit, bulkhead<br/>ShardRouter: tenant → shard"]
+  PG[("<b>Shard primary</b><br/>ONE transaction:<br/>entity_tags (PK + B-tree)<br/>tag_usage +1 · outbox row")]
+  SB[("<b>Sync standby</b><br/>other zone")]
+  P --> GW --> POD ==>|"PgBouncer"| PG
+  PG ==>|"sync WAL: wait for 1 ack"| SB
+```
+
+The data, the counter and the event commit together, so there's no dual write. The commit returns
+only after a standby in another zone has the WAL, so an acknowledged write survives losing a zone.
+The response carries the token `shard:seq`.
+
+#### B. Read: tags of an entity, entities of a tag
+
+```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 60, "rankSpacing": 90, "padding": 20}, "themeVariables": {"fontSize": "22px"}}}%%
+flowchart LR
+  P["<b>Product</b>"]
+  POD["<b>Tagging pod</b><br/>ShardRouter"]
+  subgraph PG["Shard primary"]
+    FWD[("<b>entity_tags PK</b> (forward)<br/>tenant, type, id, tag<br/>one range read · 1–2 ms")]
+    INV[("<b>ix_entity_tags_by_tag</b> (inverted B-tree)<br/>tenant, tag, entity_seq<br/>keyset page of 51 rows")]
+  end
+  P -->|"GET /entities/{type}/{id}/tags"| POD
+  POD ==>|"tags of entity (95% of traffic)"| FWD
+  POD ==>|"GET /tags/{id}/entities?cursor="| INV
+```
+
+Both reads go to the primary, so they're always current. One table, two orderings: the PK sorts by
+entity, and the B-tree sorts the same rows by tag in the same transaction.
+
+#### C. Boolean search
+
+```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 60, "rankSpacing": 80, "padding": 20}, "themeVariables": {"fontSize": "22px"}}}%%
+flowchart LR
+  P["<b>Product</b><br/>POST /search<br/>all · any · none"]
+  POD["<b>Tagging pod</b><br/>① barrier B =<br/>MAX(outbox.seq) of tenant"]
+  D{"② index<br/>watermark ≥ B?<br/>(wait ≤ 50 ms)"}
+  IDX["<b>RoaringBitmaps</b> (in pod)<br/>AND / OR / ANDNOT · ~1 ms"]
+  SQL["<b>SQL fallback</b><br/>on the inverted B-tree<br/>exact, slower"]
+  PG[("<b>Shard primary</b>")]
+  P --> POD --> D
+  D -->|"yes"| IDX
+  D -->|"no"| SQL
+  IDX -->|"③ resolve the page's<br/>50 entity_seq → refs"| PG
+  SQL --> PG
+```
+
+The bitmaps are a copy, so they're used only when they've caught up with the primary (①, ②).
+That keeps search strongly consistent without a slow SQL join on every query.
+
+#### D. Propagate changes: outbox → Kafka → consumers
+
+```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 50, "rankSpacing": 80, "padding": 20}, "themeVariables": {"fontSize": "22px"}}}%%
+flowchart LR
+  PG[("<b>Shard primary</b><br/>outbox row committed<br/>with the data")]
+  REL["<b>OutboxRelay</b><br/>one active per shard<br/>in seq order"]
+  K[["<b>Kafka · tag-events</b><br/>48 partitions<br/>key = tenantId · 7 days"]]
+  IA["<b>Index applier</b> (every pod)<br/>dedupe by seq → bitmaps<br/>advance watermark"]
+  PJ["<b>Purge job</b><br/>deleted tag → batched<br/>deletes on the shard"]
+  PS["<b>Product search</b><br/>JQL · CQL · OpenSearch"]
+  TR["<b>Trending + analytics</b><br/>(view E)"]
+  PG --> REL -->|"publish"| K
+  K --> IA
+  K --> PJ
+  K --> PS
+  K --> TR
+```
+
+Delivery is at-least-once and in order per tenant, and every consumer dedupes by `seq`. Every
+consumer is derived and can be rebuilt by replaying Kafka.
+
+#### E. Trending and analytics
+
+```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 60, "rankSpacing": 80, "padding": 20}, "themeVariables": {"fontSize": "22px"}}}%%
+flowchart LR
+  K[["<b>Kafka · tag-events</b>"]]
+  TA["<b>Trending aggregator</b><br/>group tagging-trends<br/>counts + last_seq in one txn"]
+  TS[("<b>Trend store</b><br/>hourly + daily counts<br/>~15 GB")]
+  AN["<b>Analytics sink</b><br/>group tagging-analytics"]
+  CH[("<b>ClickHouse</b><br/>events · daily rollups<br/>~17 GB/day")]
+  P["<b>Product</b><br/>GET /tags:trending"]
+  POD["<b>Tagging pod</b>"]
+  K --> TA --> TS
+  K --> AN --> CH
+  P --> POD -.->|"eventual read"| TS
+```
+
+These are off the primaries on purpose. Trending is the one read we allow to be eventual: it's a
+ranking, and it's minutes old by nature.
+
+#### F. Survive a zone failure
+
+```mermaid
+%%{init: {"flowchart": {"nodeSpacing": 60, "rankSpacing": 90, "padding": 20}, "themeVariables": {"fontSize": "22px"}}}%%
+flowchart LR
+  PB["<b>PgBouncer</b>"]
+  HA["<b>Patroni / CloudNativePG</b><br/>leader lease"]
+  PG[("<b>Primary</b><br/>zone A")]
+  SB[("<b>Sync standby</b><br/>zone B")]
+  SC[("<b>Sync standby</b><br/>zone C")]
+  PB --> PG
+  PG ==>|"sync WAL · ANY 1"| SB
+  PG ==>|"sync WAL"| SC
+  HA -.->|"watch"| PG
+  HA -->|"A lost: fence A,<br/>promote the synced standby"| SB
+```
+
+Quorum `ANY 1` means every acknowledged commit is on at least one other zone. The old primary is
+fenced before the standby is promoted, so there are never two writers.
+
+### 4.2 The big picture
+
+All six views on one page. The edge labels say which view (A–F) each arrow comes from.
 
 ```mermaid
 %%{init: {"flowchart": {"nodeSpacing": 70, "rankSpacing": 90, "padding": 20}, "themeVariables": {"fontSize": "22px"}}}%%
@@ -153,7 +289,7 @@ flowchart TB
     RT["<b>ShardRouter</b><br/>tenant → shard (stored placement)"]
     IDX["<b>RoaringBitmap inverted index</b><br/>tag → bitmap of entity_seq · watermark<br/>(boolean search, §5.3)"]
     API --> ISO --> RT
-    API -->|"boolean search"| IDX
+    API -->|"C · boolean search"| IDX
   end
 
   subgraph SH["One of 16 PostgreSQL shards · 3 zones"]
@@ -162,7 +298,7 @@ flowchart TB
     SB[("<b>Sync standby</b><br/>zone B")]
     SC[("<b>Sync standby</b><br/>zone C")]
     PB --> PG
-    PG == "sync WAL · quorum ANY 1" ==> SB
+    PG == "A F · sync WAL · quorum ANY 1" ==> SB
     PG == "sync WAL" ==> SC
   end
 
@@ -180,17 +316,17 @@ flowchart TB
   CH[("<b>ClickHouse</b><br/>events · daily rollups")]
 
   CL --> GW --> API
-  RT ==>|"every read and write"| PB
-  IDX -. "read barrier: MAX(outbox seq)" .-> PB
-  HA -. "watches" .-> SH
-  PG -->|"outbox rows in seq order"| REL
-  REL -->|"publish"| K
+  RT ==>|"A B · every read and write"| PB
+  IDX -. "C · read barrier: MAX(outbox seq)" .-> PB
+  HA -. "F · watches" .-> SH
+  PG -->|"D · outbox rows in seq order"| REL
+  REL -->|"D · publish"| K
   K --> IA
   K --> PJ
-  K --> TA --> TS
-  K --> AN --> CH
+  K -->|"E"| TA --> TS
+  K -->|"E"| AN --> CH
   K --> PS
-  API -. "GET tags:trending (eventual)" .-> TS
+  API -. "E · GET tags:trending (eventual)" .-> TS
 ```
 
 **How to read it.** **Thick arrows** are the strong path: every read and write goes to the shard
@@ -199,7 +335,7 @@ event path: the outbox row commits with the data, the relay publishes it in orde
 consumer below Kafka is derived and can be rebuilt. **Dotted arrows** are the search read barrier
 and the one explicitly eventual read (trending).
 
-### 4.2 The four request paths
+### 4.3 The four request paths
 
 ```mermaid
 %%{init: {"themeVariables": {"fontSize": "20px"}, "sequence": {"actorMargin": 80, "messageMargin": 45, "boxMargin": 15}}}%%
@@ -255,7 +391,7 @@ sequenceDiagram
   end
 ```
 
-### 4.3 Why each box, and what we left out
+### 4.4 Why each box, and what we left out
 
 | Component | Why it's there | Rejected alternative |
 |---|---|---|
