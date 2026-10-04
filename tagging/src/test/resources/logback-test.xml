@@ -1,0 +1,10 @@
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder><pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern></encoder>
+    </appender>
+    <logger name="com.salesforce.einstein.tagging" level="INFO"/>
+    <!-- In tests H2 stands in for Postgres; Flyway's "H2 is newer than tested" notice is noise here.
+         Production runs on Postgres, which this Flyway version fully supports. -->
+    <logger name="org.flywaydb.core.internal.database.base.Database" level="ERROR"/>
+    <root level="WARN"><appender-ref ref="STDOUT"/></root>
+</configuration>

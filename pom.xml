@@ -11,6 +11,7 @@
     <modules>
         <module>ds</module>
         <module>scheduler</module>
+        <module>tagging</module>
     </modules>
 
     <properties>

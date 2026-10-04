@@ -1,0 +1,28 @@
+# Same file on AWS and GCP; only the env values differ (Helm values-aws.yaml / values-gcp.yaml).
+tagging:
+  providers:
+    store: jdbc
+    events: kafka
+  worker-id: ${POD_ORDINAL:0}
+  shards:
+    s0:
+      url: ${TAGGING_S0_URL}
+      replica-url: ${TAGGING_S0_REPLICA_URL:}
+      username: ${TAGGING_DB_USER}
+      password: ${TAGGING_DB_PASSWORD}
+      pool-size: 20
+    s1:
+      url: ${TAGGING_S1_URL}
+      replica-url: ${TAGGING_S1_REPLICA_URL:}
+      username: ${TAGGING_DB_USER}
+      password: ${TAGGING_DB_PASSWORD}
+      pool-size: 20
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
+    topic: tag-events
+    pod-id: ${HOSTNAME:}
+  relay:
+    outbox-retention: 24h   # Kafka (7 d) is the replay log; the outbox only has to cover relay outages
+  index:
+    max-tenants: 5000
+    bootstrap-threads: 4

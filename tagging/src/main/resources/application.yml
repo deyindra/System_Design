@@ -1,0 +1,46 @@
+spring:
+  application:
+    name: tagging
+  jackson:
+    mapper:
+      accept-case-insensitive-enums: true
+    default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false
+  mvc:
+    problemdetails:
+      enabled: true
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: tagging
+
+# Defaults run fully in-process: one H2 shard (s0), in-process events, Roaring index.
+tagging:
+  providers:
+    store: jdbc          # jdbc | memory
+    events: inprocess    # inprocess | kafka
+  default-tier: STANDARD
+  tiers:
+    PREMIUM:
+      reads-per-second: 10000
+      writes-per-second: 2000
+      searches-per-second: 1000
+      max-concurrent: 256
+      max-concurrent-bulk: 16
+  relay:
+    interval-ms: 50
