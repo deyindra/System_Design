@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.salesforce.einstein</groupId>
+        <artifactId>lld</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <!-- The crawler: the core application and the distributed adapters, built together in this order. -->
+    <artifactId>webcrawler-parent</artifactId>
+    <packaging>pom</packaging>
+
+    <modules>
+        <module>core</module>
+        <module>adapter-kafka</module>
+        <module>adapter-redis-cql</module>
+        <module>it</module>
+    </modules>
+
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <spring-boot.version>3.3.4</spring-boot.version>
+        <!-- Boot 3.3 ships 1.19.x, which predates current Docker Engine API defaults. -->
+        <testcontainers.version>1.21.4</testcontainers.version>
+    </properties>
+
+    <!-- `lld` stays the parent, so Spring Boot is imported as a BOM rather than a parent. The Testcontainers BOM
+         comes first so that it wins over the older version Boot manages. -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>${testcontainers.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.salesforce.einstein</groupId>
+                <artifactId>webcrawler</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.salesforce.einstein</groupId>
+                <artifactId>webcrawler</artifactId>
+                <version>${project.version}</version>
+                <type>test-jar</type>
+            </dependency>
+            <dependency>
+                <groupId>com.salesforce.einstein</groupId>
+                <artifactId>webcrawler-adapter-kafka</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.salesforce.einstein</groupId>
+                <artifactId>webcrawler-adapter-redis-cql</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <build>
+        <plugins>
+            <!-- -parameters: Spring binds @PathVariable/@RequestParam and record properties by parameter name. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <release>17</release>
+                    <parameters>true</parameters>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

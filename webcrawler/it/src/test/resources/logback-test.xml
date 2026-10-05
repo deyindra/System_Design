@@ -1,0 +1,13 @@
+<configuration>
+    <appender name="OUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder><pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{20} - %msg%n</pattern></encoder>
+    </appender>
+    <logger name="com.datastax" level="WARN"/>
+    <logger name="io.lettuce" level="WARN"/>
+    <logger name="com.zaxxer" level="WARN"/>
+    <logger name="org.testcontainers" level="WARN"/>
+    <logger name="tc" level="WARN"/>
+    <logger name="org.apache.kafka" level="WARN"/>
+    <logger name="com.github.dockerjava" level="WARN"/>
+    <root level="INFO"><appender-ref ref="OUT"/></root>
+</configuration>

@@ -12,6 +12,9 @@
         <module>ds</module>
         <module>scheduler</module>
         <module>tagging</module>
+        <module>webcrawler</module>
+        <module>taskabstraction</module>
+        <module>graphexecutor</module>
     </modules>
 
     <properties>

@@ -1,0 +1,37 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: webcrawler
+  jackson:
+    default-property-inclusion: non_null
+crawler:
+  workers: 16
+  politeness-delay: 1s       # minimum gap between two requests to one host; robots Crawl-delay may raise it
+  max-retries: 3             # timeouts, 429, 5xx
+  retry-backoff: 2s          # doubles per attempt
+  max-redirects: 5
+  max-page-bytes: 5242880    # 5 MiB of HTML
+  agent-token: EinsteinCrawler
+  connect-timeout: 5s
+  fetch-timeout: 30s
+  max-sync-wait: 30s
+  # Which implementation backs each port. Provider modules add their own values (see docs/PORTABILITY.md).
+  adapters:
+    frontier: memory
+    job-store: memory
+    page-store: memory
+    content-store: memory    # memory | filesystem
+    content-root: ./data/blobs
+  # SSRF guard for every fetch and webhook: public addresses on these ports only.
+  egress:
+    allow-private: false     # true only for local development against private-network sites
+    ports: [80, 443, 8080, 8443]
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
