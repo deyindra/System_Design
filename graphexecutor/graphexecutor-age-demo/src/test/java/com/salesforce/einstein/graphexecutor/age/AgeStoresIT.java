@@ -183,6 +183,38 @@ class AgeStoresIT {
         assertEquals(AgeContainers.levels(dag), rounds(new PostgresCompletionLog<>(tables, "topological-run", CODEC)));
     }
 
+    @Test
+    void threeWorkersTraverseAStoredUndirectedGraph() {
+        Graph<String> graph = Graph.undirected();   // sparse, so there are several components
+        Graph<String> arcs = RandomGraph.generate(12, 150, 160, false);
+        arcs.nodes().forEach(graph::addNode);
+        arcs.nodes().forEach(from -> arcs.successors(from).forEach(to -> graph.addEdge(from, to)));
+        AgeGraphLoader.byKey(cypher, AgeGraph.named("undirected"), CODEC, SHARDS).create().load(graph, 50);
+        try (GraphStore<String> store = AgeGraphStore.byKey(cypher, AgeGraph.named("undirected"), CODEC, SHARDS, false)) {
+            assertFalse(store.isDirected());
+            List<String> nodes = new ArrayList<>(graph.nodes());
+            Map<String, List<String>> successors = store.successors(nodes);
+            Map<String, List<String>> predecessors = store.predecessors(nodes);
+            for (String node : nodes) {
+                assertEquals(graph.successors(node), Set.copyOf(successors.get(node)), node);
+                assertEquals(graph.successors(node), Set.copyOf(predecessors.get(node)), node);
+            }
+            Graph<String> loaded = GraphStore.load(store, 13);
+            assertFalse(loaded.isDirected());
+            assertEquals(graph.edgeCount(), loaded.edgeCount());
+
+            ClusterReport report = runThree("undirected-run", worker -> Worker.traversal(
+                    new RecordingTraversal.Executor(null), Set.of(AgeContainers.ROOT), store,
+                    new PostgresCompletionLog<>(tables, "undirected-run", CODEC), CODEC,
+                    new PostgresClusterStore(tables), config("undirected-run", worker)));
+
+            assertEquals(RunStatus.DONE, report.status());
+        }
+        Map<String, Integer> depths = AgeContainers.depths(graph);
+        assertTrue(depths.size() > 1 && depths.size() < graph.nodeCount(), "one component, not all: " + depths.size());
+        assertEquals(depths, rounds(new PostgresCompletionLog<>(tables, "undirected-run", CODEC)));
+    }
+
     private static Worker.Config config(String run, String worker) {
         return Worker.Config.of(run, worker).withMaxShards(2).withLease(Duration.ofSeconds(5), Duration.ofMillis(10))
                 .withBatchSize(25);

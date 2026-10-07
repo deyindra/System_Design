@@ -53,13 +53,14 @@ public record Neo4jWorkerContext(Map<String, String> env, Driver driver, Neo4jSe
                 AuthTokens.basic(env.getOrDefault("NEO4J_USER", "neo4j"), env.getOrDefault("NEO4J_PASSWORD", "")));
     }
 
+    /** @param shardOf the shard function the graph was loaded with */
     public <T> GraphStore<T> graphStore(NodeCodec<T> codec, ToIntFunction<? super T> shardOf) {
         return new Neo4jGraphStore<>(sessions, graph, codec, shards, shardOf);
     }
 
     /** Sharded by {@link GraphStore#byKey} on the codec's key. */
     public <T> GraphStore<T> graphStore(NodeCodec<T> codec) {
-        return Neo4jGraphStore.byKey(sessions, graph, codec, shards);
+        return graphStore(codec, GraphStore.byKey(codec::encode, shards));
     }
 
     public <T> CompletionLog<T> completionLog(NodeCodec<T> codec) {

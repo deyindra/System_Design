@@ -51,13 +51,14 @@ public record AgeWorkerContext(Map<String, String> env, PgConnections graphConne
                 AgeGraph.named(env.getOrDefault("GRAPH", "graph")), shards, config);
     }
 
+    /** @param shardOf the shard function the graph was loaded with */
     public <T> GraphStore<T> graphStore(NodeCodec<T> codec, ToIntFunction<? super T> shardOf) {
         return new AgeGraphStore<>(graphConnections, graph, codec, shards, shardOf);
     }
 
     /** Sharded by {@link GraphStore#byKey} on the codec's key. */
     public <T> GraphStore<T> graphStore(NodeCodec<T> codec) {
-        return AgeGraphStore.byKey(graphConnections, graph, codec, shards);
+        return graphStore(codec, GraphStore.byKey(codec::encode, shards));
     }
 
     public <T> CompletionLog<T> completionLog(NodeCodec<T> codec) {

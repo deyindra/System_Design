@@ -13,7 +13,7 @@ import java.util.concurrent.Executor;
 /**
  * What both distributed executors build first, on the calling thread: an independent copy of the graph,
  * its nodes in insertion order, each node's neighbors in both directions (for grouping and placement),
- * and the insertion order as a comparator.
+ * and the insertion order as a comparator. The graph may be directed or undirected.
  */
 record GraphSnapshot<T>(Graph<T> graph, List<T> nodes, Map<T, List<T>> neighbors, Comparator<T> graphOrder) {
 
@@ -22,9 +22,6 @@ record GraphSnapshot<T>(Graph<T> graph, List<T> nodes, Map<T, List<T>> neighbors
     }
 
     static <T> GraphSnapshot<T> of(Graph<T> graph) {
-        if (!graph.isDirected()) {
-            throw new IllegalArgumentException("needs a directed (unidirectional) graph");
-        }
         Graph<T> snapshot = graph.subgraph(graph.nodes());
         List<T> nodes = List.copyOf(snapshot.nodes());
         Map<T, Integer> index = new HashMap<>();
@@ -32,7 +29,9 @@ record GraphSnapshot<T>(Graph<T> graph, List<T> nodes, Map<T, List<T>> neighbors
         for (T node : nodes) {
             index.put(node, index.size());
             List<T> either = new ArrayList<>(snapshot.successors(node));
-            either.addAll(snapshot.predecessors(node));
+            if (snapshot.isDirected()) {
+                either.addAll(snapshot.predecessors(node));   // undirected: successors are already every neighbor
+            }
             neighbors.put(node, either);
         }
         return new GraphSnapshot<>(snapshot, nodes, neighbors, Comparator.comparingInt(index::get));
@@ -49,7 +48,7 @@ record GraphSnapshot<T>(Graph<T> graph, List<T> nodes, Map<T, List<T>> neighbors
         return new Groups<>(List.copyOf(byLabel.values()), components.rounds());
     }
 
-    /** Edges whose ends have different owners. */
+    /** Edges whose ends have different owners. An undirected edge counts once, not once per end. */
     long edgeCut(Map<T, Integer> ownerOf) {
         long cut = 0;
         for (T from : nodes) {
@@ -59,6 +58,6 @@ record GraphSnapshot<T>(Graph<T> graph, List<T> nodes, Map<T, List<T>> neighbors
                 }
             }
         }
-        return cut;
+        return graph.isDirected() ? cut : cut / 2;   // undirected: each cut edge was seen from both ends
     }
 }

@@ -10,9 +10,10 @@ import java.util.function.Function;
 import java.util.function.ToIntFunction;
 
 /**
- * A read-only directed graph too large for one JVM, kept in a store (a graph database) and read in pieces.
- * It is split into {@link #shards()} shards: every node belongs to exactly one, given by {@link #shardOf}, a
- * pure function that every machine computes the same way, so no machine needs a directory of all nodes.
+ * A read-only graph, directed or undirected, too large for one JVM, kept in a store (a graph database) and
+ * read in pieces. It is split into {@link #shards()} shards: every node belongs to exactly one, given by
+ * {@link #shardOf}, a pure function that every machine computes the same way, so no machine needs a
+ * directory of all nodes.
  *
  * <p>The opposite of {@link Graph}, which is whole, mutable and in memory: here there is no "all nodes" or
  * "node count" call, only pages of one shard and the edges of a batch of nodes, so a reader's memory
@@ -25,6 +26,15 @@ import java.util.function.ToIntFunction;
  * @param <T> node type
  */
 public interface GraphStore<T> extends AutoCloseable {
+
+    /**
+     * Whether edges have a direction. An undirected store lists each edge in both directions, so
+     * {@link #successors} and {@link #predecessors} both give a node's neighbors and {@link #sources} are
+     * only the isolated nodes. Default: directed.
+     */
+    default boolean isDirected() {
+        return true;
+    }
 
     /** How many shards; shards are numbered 0..shards()-1. */
     int shards();
@@ -69,10 +79,12 @@ public interface GraphStore<T> extends AutoCloseable {
 
     /**
      * Reads a whole store into a {@link Graph}, for the one-VM executors when a stored graph turns out to
-     * be small enough. O(nodes + edges) memory, so only for graphs that fit.
+     * be small enough, directed or undirected as the store is. O(nodes + edges) memory, so only for graphs
+     * that fit.
      */
     static <T> Graph<T> load(GraphStore<T> store, int pageSize) {
-        Graph<T> graph = Graph.directed();
+        // undirected: each edge is read from both ends, and adding it again is a no-op
+        Graph<T> graph = store.isDirected() ? Graph.directed() : Graph.undirected();
         for (int shard = 0; shard < store.shards(); shard++) {
             for (List<T> page = store.nodes(shard, null, pageSize); !page.isEmpty();
                  page = store.nodes(shard, page.get(page.size() - 1), pageSize)) {

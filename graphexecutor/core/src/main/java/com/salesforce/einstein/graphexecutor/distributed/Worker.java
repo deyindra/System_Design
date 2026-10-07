@@ -108,10 +108,16 @@ public final class Worker<T> {
      * A worker of a breadth-first traversal (see {@link DistributedTraversalExecutor}). The executor's
      * {@code roots(Graph)} and {@code startRootlessGroups()} need the whole graph, so they are not asked:
      * traversal starts at {@code roots}, or at every node without predecessors when that is empty.
+     * An undirected store needs {@code roots}: its only nodes without predecessors are isolated ones.
+     *
+     * @throws IllegalArgumentException if the store is undirected and {@code roots} is empty
      */
     public static <T> Worker<T> traversal(DistributedTraversalExecutor<T> executor, Set<T> roots, GraphStore<T> graph,
                                           CompletionLog<T> log, NodeCodec<T> codec, ClusterStore cluster,
                                           Config config) {
+        if (!graph.isDirected() && roots.isEmpty()) {
+            throw new IllegalArgumentException("an undirected store needs explicit roots");
+        }
         return new Worker<>(new TraversalJob<>(executor, roots, graph, log, codec, config.batchSize()),
                 graph.shards(), cluster, config);
     }
@@ -119,6 +125,7 @@ public final class Worker<T> {
     /**
      * A worker of a dependency-ordered run (see {@link DistributedTopologicalExecutor}). Nodes on a cycle,
      * and their dependants, never run; there is no up-front cycle check (it would read the whole graph).
+     * In an undirected store every edge is a two-node cycle, so only isolated nodes run.
      */
     public static <T> Worker<T> topological(DistributedTopologicalExecutor<T> executor, GraphStore<T> graph,
                                             CompletionLog<T> log, NodeCodec<T> codec, ClusterStore cluster,

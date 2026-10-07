@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -252,6 +253,44 @@ class TraversalTaskExecutorTest {
         assertEquals(2, results.size());
         assertEquals(Set.of("a", "b"), Set.copyOf(results.get(0).value().completed()));
         assertEquals(Set.of("c", "d"), Set.copyOf(results.get(1).value().completed()));
+    }
+
+    /**
+     * a-b, c-b, c-d, d-d (a self-loop) and x-y, undirected, and as a directed graph with an arc each way.
+     * "c" is reached from "b" only through an edge written c's way round: undirected edges go both ways.
+     */
+    private static List<Graph<String>> undirectedAndItsTwin() {
+        Graph<String> undirected = Graph.undirected();
+        Graph<String> twin = Graph.directed();
+        for (String edge : List.of("a-b", "c-b", "c-d", "d-d", "x-y")) {
+            String[] ends = edge.split("-");
+            undirected.addEdge(ends[0], ends[1]);
+            twin.addEdge(ends[0], ends[1]);
+            twin.addEdge(ends[1], ends[0]);
+        }
+        return List.of(undirected, twin);
+    }
+
+    @Test
+    void anUndirectedGraphIsTraversedLikeItsTwoWayDirectedTwin() {
+        List<Graph<String>> graphs = undirectedAndItsTwin();
+        for (Set<String> roots : Arrays.asList(null, Set.of("d"))) {
+            List<List<Map<String, Integer>>> depths = new ArrayList<>();   // per graph, per group
+            for (Graph<String> g : graphs) {
+                Recording executor = new Recording(groupPool, taskPool);
+                executor.roots = roots;
+                List<TraversalResult<String>> results = executor.execute(g).stream().map(GroupResult::value).toList();
+                results.forEach(r -> assertEquals(r.depth().keySet(), Set.copyOf(r.completed())));
+                depths.add(results.stream().map(TraversalResult::depth).toList());
+                executor.runs.values().forEach(count -> assertEquals(1, count.get()));
+            }
+            assertEquals(depths.get(1), depths.get(0), "roots " + roots);
+        }
+
+        Recording executor = new Recording(groupPool, taskPool);   // no node without neighbors: first nodes start
+        List<GroupResult<String, TraversalResult<String>>> byDefault = executor.execute(graphs.get(0));
+        assertEquals(Map.of("a", 0, "b", 1, "c", 2, "d", 3), byDefault.get(0).value().depth());
+        assertEquals(Map.of("x", 0, "y", 1), byDefault.get(1).value().depth());
     }
 
     @Test

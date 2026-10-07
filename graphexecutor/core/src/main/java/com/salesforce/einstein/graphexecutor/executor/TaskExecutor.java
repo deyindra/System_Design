@@ -14,13 +14,14 @@ import java.util.concurrent.Executor;
 import java.util.function.Function;
 
 /**
- * Runs a unidirectional graph of tasks by splitting it into groups that cannot affect each other and
- * processing those groups concurrently.
+ * Runs a graph of tasks, directed (unidirectional) or undirected (bidirectional), by splitting it into
+ * groups that cannot affect each other and processing those groups concurrently.
  *
  * <p><b>What is a group?</b> A <em>weakly</em> connected component: nodes joined by edges followed in
  * either direction. Direction matters for ordering <em>inside</em> a group (a -> b may mean "a before
  * b"), but for independence any edge is a link: a and b in {@code a -> c <- b} both touch c, so they
  * belong together. Strongly connected components would be wrong here: they would put a and b apart.
+ * In an undirected graph every edge already goes both ways, so a group is simply a connected component.
  *
  * <p><b>Template method.</b> {@link #execute}/{@link #submit} are final and own the orchestration:
  * <ol>
@@ -36,7 +37,8 @@ import java.util.function.Function;
  * <p><b>Failure isolation.</b> An exception from one group becomes that group's {@link GroupResult};
  * the other groups still run to completion.
  *
- * <p>The graph must be directed; weighted or unweighted are both fine (weights reach each group's copy).
+ * <p>The graph may be directed or undirected, weighted or unweighted: each group's copy keeps both
+ * (an undirected graph's {@code predecessors} and {@code successors} are both its neighbors).
  *
  * <p>The executor does not own the thread pool: callers create it, size it and shut it down.
  *
@@ -81,14 +83,10 @@ public abstract class TaskExecutor<T, R> {
      * Starts processing every group and returns at once. The graph is fully read before this returns,
      * so the caller may modify it immediately afterwards.
      *
-     * @throws IllegalArgumentException if the graph is undirected
-     * @throws IneligibleGraphException  if a group fails {@link #validateGroup} under
-     *                                   {@link IneligibleGroupPolicy#REJECT_GRAPH}; nothing has run
+     * @throws IneligibleGraphException if a group fails {@link #validateGroup} under
+     *                                  {@link IneligibleGroupPolicy#REJECT_GRAPH}; nothing has run
      */
     public final CompletableFuture<List<GroupResult<T, R>>> submit(Graph<T> graph) {
-        if (!graph.isDirected()) {
-            throw new IllegalArgumentException("TaskExecutor needs a directed (unidirectional) graph");
-        }
         List<TaskGroup<T>> groups = findGroups(graph);
 
         // validate everything before dispatching anything, so REJECT_GRAPH really means "nothing ran"
@@ -122,7 +120,9 @@ public abstract class TaskExecutor<T, R> {
      * is weakly connected components; override for another notion of independence.
      */
     protected List<TaskGroup<T>> findGroups(Graph<T> graph) {
-        Function<T, Iterable<T>> eitherDirection = node -> concat(graph.successors(node), graph.predecessors(node));
+        Function<T, Iterable<T>> eitherDirection = graph.isDirected()
+                ? node -> concat(graph.successors(node), graph.predecessors(node))
+                : graph::successors;   // undirected: successors are already every neighbor
         Set<T> assigned = new HashSet<>();
         List<TaskGroup<T>> groups = new ArrayList<>();
         for (T node : graph.nodes()) {

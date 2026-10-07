@@ -20,6 +20,9 @@ import java.util.function.ToIntFunction;
  * keyset-paged on {@code (shard, key)}, and the edges of a batch of nodes are matched with {@code key IN $keys},
  * both served by the loader's indexes.
  *
+ * <p>An undirected graph is stored as an edge each way (the loader writes every node's successors), so the
+ * queries are the same; only {@link #isDirected()} differs.
+ *
  * <p>The shard function is given, not read from the vertices, so every worker computes it without a query;
  * it must be the one the graph was loaded with.
  *
@@ -31,6 +34,7 @@ public final class AgeGraphStore<T> implements GraphStore<T> {
     private final NodeCodec<T> codec;
     private final int shards;
     private final ToIntFunction<? super T> shardOf;
+    private final boolean directed;
     private final String nodesFrom;
     private final String nodesAfter;
     private final String sourcesFrom;
@@ -44,6 +48,16 @@ public final class AgeGraphStore<T> implements GraphStore<T> {
      */
     public AgeGraphStore(PgConnections connections, AgeGraph graph, NodeCodec<T> codec, int shards,
                          ToIntFunction<? super T> shardOf) {
+        this(connections, graph, codec, shards, shardOf, true);
+    }
+
+    /**
+     * @param shardOf  the loader's shard function
+     * @param directed false for an undirected graph, which the loader wrote as an edge each way
+     */
+    public AgeGraphStore(PgConnections connections, AgeGraph graph, NodeCodec<T> codec, int shards,
+                         ToIntFunction<? super T> shardOf, boolean directed) {
+        this.directed = directed;
         this.connections = Objects.requireNonNull(connections, "connections");
         this.codec = Objects.requireNonNull(codec, "codec");
         this.shardOf = Objects.requireNonNull(shardOf, "shardOf");
@@ -70,7 +84,19 @@ public final class AgeGraphStore<T> implements GraphStore<T> {
     /** Shards by {@link GraphStore#byKey} on the codec's key: what {@link AgeGraphLoader#byKey} loads with. */
     public static <T> AgeGraphStore<T> byKey(PgConnections connections, AgeGraph graph, NodeCodec<T> codec,
                                              int shards) {
-        return new AgeGraphStore<>(connections, graph, codec, shards, GraphStore.byKey(codec::encode, shards));
+        return byKey(connections, graph, codec, shards, true);
+    }
+
+    /** As {@link #byKey(PgConnections, AgeGraph, NodeCodec, int)}, directed or not. */
+    public static <T> AgeGraphStore<T> byKey(PgConnections connections, AgeGraph graph, NodeCodec<T> codec,
+                                             int shards, boolean directed) {
+        return new AgeGraphStore<>(connections, graph, codec, shards, GraphStore.byKey(codec::encode, shards),
+                directed);
+    }
+
+    @Override
+    public boolean isDirected() {
+        return directed;
     }
 
     @Override

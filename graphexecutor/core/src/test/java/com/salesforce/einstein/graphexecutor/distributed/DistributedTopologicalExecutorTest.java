@@ -192,6 +192,20 @@ class DistributedTopologicalExecutorTest {
     }
 
     @Test
+    void everyUndirectedEdgeIsACycleSoOnlyIsolatedNodesRun() {
+        Graph<String> g = Graph.undirected();
+        g.addEdge("a", "b");
+        g.addEdge("b", "c");
+        g.addNode("solo");
+        Recording executor = new Recording(2, Partitioner.hash(), IneligibleGroupPolicy.ISOLATE_GROUP);
+        RunReport<String> report = executor.execute(g);
+
+        assertEquals(Map.of(0, List.of("a", "b", "c")), report.rejectedGroups());
+        assertEquals(Set.of("solo"), executor.runs.keySet());
+        assertThrows(CyclicGraphException.class, () -> new Recording(2).execute(g));
+    }
+
+    @Test
     void failedTaskSkipsOnlyItsDependants() {
         Graph<String> g = Graph.directed();
         g.addEdge("a", "fail");

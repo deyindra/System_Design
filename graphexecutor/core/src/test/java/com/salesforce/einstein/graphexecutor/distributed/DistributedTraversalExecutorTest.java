@@ -8,6 +8,7 @@ import com.salesforce.einstein.graphexecutor.executor.TraversalTaskExecutor;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -222,6 +223,45 @@ class DistributedTraversalExecutorTest {
         } finally {
             taskPool.shutdownNow();
         }
+    }
+
+    @Test
+    void anUndirectedGraphRunsLikeItsTwoWayDirectedTwinAndCountsEachCutEdgeOnce() {
+        Graph<String> directed = randomGraph(7);
+        Graph<String> undirected = Graph.undirected();
+        Graph<String> twin = Graph.directed();
+        for (String node : directed.nodes()) {
+            undirected.addNode(node);
+            twin.addNode(node);
+            for (String to : directed.successors(node)) {
+                undirected.addEdge(node, to);
+                twin.addEdge(node, to);
+                twin.addEdge(to, node);
+            }
+        }
+        for (Set<String> roots : Arrays.asList(null, Set.of("n1", "n60"))) {
+            TraversalReport<String> one = run(undirected, roots);
+            TraversalReport<String> other = run(twin, roots);
+
+            assertEquals(other.depth(), one.depth());
+            assertEquals(other.failed().keySet(), one.failed().keySet());
+            assertEquals(Set.copyOf(other.excluded()), Set.copyOf(one.excluded()));
+            assertEquals(Set.copyOf(other.unreachable()), Set.copyOf(one.unreachable()));
+            assertEquals(other.rounds().stream().map(Set::copyOf).toList(),
+                    one.rounds().stream().map(Set::copyOf).toList());
+            assertTrue(other.stats().edgeCut() > 0);
+            assertEquals(other.stats().edgeCut() / 2, one.stats().edgeCut());   // the twin has every edge twice
+        }
+    }
+
+    /** Placement by hash, so both graphs put every node on the same partition. */
+    private TraversalReport<String> run(Graph<String> g, Set<String> roots) {
+        Recording executor = new Recording(4);
+        executor.byHost = true;
+        executor.roots = roots;
+        TraversalReport<String> report = executor.execute(g);
+        executor.runs.values().forEach(count -> assertEquals(1, count.get()));
+        return report;
     }
 
     @Test

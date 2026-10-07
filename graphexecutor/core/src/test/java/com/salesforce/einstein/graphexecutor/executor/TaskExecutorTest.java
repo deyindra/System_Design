@@ -408,10 +408,34 @@ class TaskExecutorTest {
     }
 
     @Test
-    void rejectsUndirectedGraph() {
+    void undirectedGraphGroupsAreConnectedComponents() {
         Graph<String> g = Graph.undirected();
         g.addEdge("a", "b");
-        assertThrows(IllegalArgumentException.class, () -> new NodeSetExecutor().submit(g));
+        g.addEdge("c", "b");
+        g.addEdge("x", "y");
+        g.addNode("z");
+
+        List<GroupResult<String, Set<String>>> results = new NodeSetExecutor().execute(g);
+
+        assertEquals(List.of(Set.of("a", "b", "c"), Set.of("x", "y"), Set.of("z")),
+                results.stream().map(GroupResult::value).toList());
+        assertFalse(results.get(0).group().graph().isDirected());
+        assertEquals(2, results.get(0).group().graph().edgeCount());
+    }
+
+    @Test
+    void undirectedEdgeIsACycleSoOnlyIsolatedNodesRunInDependencyOrder() {
+        Graph<String> g = Graph.undirected();
+        g.addEdge("a", "b");
+        g.addNode("c");
+        RecordingExecutor executor = new RecordingExecutor(IneligibleGroupPolicy.ISOLATE_GROUP);
+
+        List<GroupResult<String, List<String>>> results = executor.execute(g);
+
+        CycleDetectedException cycle = assertInstanceOf(CycleDetectedException.class, results.get(0).error());
+        assertEquals(List.of("a", "b"), cycle.blocked());
+        assertTrue(results.get(1).isSuccess());
+        assertEquals(Set.of("c"), executor.threadByTask.keySet());
     }
 
     @Test

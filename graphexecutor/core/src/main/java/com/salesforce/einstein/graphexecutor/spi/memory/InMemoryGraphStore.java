@@ -15,8 +15,8 @@ import java.util.function.Predicate;
 import java.util.function.ToIntFunction;
 
 /**
- * An in-memory store over a copy of a {@link Graph}, its nodes listed per shard in insertion order. Used to test
- * code written against stores, and to run it on graphs that do fit in memory.
+ * An in-memory store over a copy of a {@link Graph}, directed or undirected, its nodes listed per shard in
+ * insertion order. Used to test code written against stores, and to run it on graphs that do fit in memory.
  */
 public final class InMemoryGraphStore<T> implements GraphStore<T> {
     private final Graph<T> graph;
@@ -31,9 +31,6 @@ public final class InMemoryGraphStore<T> implements GraphStore<T> {
     }
 
     private InMemoryGraphStore(Graph<T> graph, int shards, ToIntFunction<? super T> shardOf) {
-        if (!graph.isDirected()) {
-            throw new IllegalArgumentException("needs a directed graph");
-        }
         if (shards < 1) {
             throw new IllegalArgumentException("shards must be >= 1");
         }
@@ -48,6 +45,11 @@ public final class InMemoryGraphStore<T> implements GraphStore<T> {
             position.put(node, shard.size());
             shard.add(node);
         }
+    }
+
+    @Override
+    public boolean isDirected() {
+        return graph.isDirected();
     }
 
     @Override

@@ -19,6 +19,9 @@ import java.util.function.ToIntFunction;
  * shard is keyset-paged on the {@code (shard, key)} index, and the edges of a batch of nodes are an
  * {@code UNWIND $keys} served by the uniqueness constraint on {@code key}.
  *
+ * <p>An undirected graph is stored as an edge each way (the loader writes every node's successors), so the
+ * queries are the same; only {@link #isDirected()} differs.
+ *
  * <p>The shard function is given, not read from the nodes, so every worker computes it without a query; it
  * must be the one the graph was loaded with.
  *
@@ -30,6 +33,7 @@ public final class Neo4jGraphStore<T> implements GraphStore<T> {
     private final NodeCodec<T> codec;
     private final int shards;
     private final ToIntFunction<? super T> shardOf;
+    private final boolean directed;
     private final String nodesFrom;
     private final String nodesAfter;
     private final String sourcesFrom;
@@ -40,6 +44,16 @@ public final class Neo4jGraphStore<T> implements GraphStore<T> {
     /** @param shardOf the loader's shard function */
     public Neo4jGraphStore(Neo4jSessions sessions, Neo4jGraph graph, NodeCodec<T> codec, int shards,
                            ToIntFunction<? super T> shardOf) {
+        this(sessions, graph, codec, shards, shardOf, true);
+    }
+
+    /**
+     * @param shardOf  the loader's shard function
+     * @param directed false for an undirected graph, which the loader wrote as an edge each way
+     */
+    public Neo4jGraphStore(Neo4jSessions sessions, Neo4jGraph graph, NodeCodec<T> codec, int shards,
+                           ToIntFunction<? super T> shardOf, boolean directed) {
+        this.directed = directed;
         this.sessions = Objects.requireNonNull(sessions, "sessions");
         this.codec = Objects.requireNonNull(codec, "codec");
         this.shardOf = Objects.requireNonNull(shardOf, "shardOf");
@@ -68,7 +82,18 @@ public final class Neo4jGraphStore<T> implements GraphStore<T> {
     /** Shards by {@link GraphStore#byKey} on the codec's key: what {@link Neo4jGraphLoader#byKey} loads with. */
     public static <T> Neo4jGraphStore<T> byKey(Neo4jSessions sessions, Neo4jGraph graph, NodeCodec<T> codec,
                                                int shards) {
-        return new Neo4jGraphStore<>(sessions, graph, codec, shards, GraphStore.byKey(codec::encode, shards));
+        return byKey(sessions, graph, codec, shards, true);
+    }
+
+    /** As {@link #byKey(Neo4jSessions, Neo4jGraph, NodeCodec, int)}, directed or not. */
+    public static <T> Neo4jGraphStore<T> byKey(Neo4jSessions sessions, Neo4jGraph graph, NodeCodec<T> codec,
+                                               int shards, boolean directed) {
+        return new Neo4jGraphStore<>(sessions, graph, codec, shards, GraphStore.byKey(codec::encode, shards), directed);
+    }
+
+    @Override
+    public boolean isDirected() {
+        return directed;
     }
 
     @Override

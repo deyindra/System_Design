@@ -35,7 +35,7 @@ mvn install          # unit tests, then the ITs (failsafe, after package: they b
 
 ```mermaid
 flowchart LR
-    G["Graph (directed)"] --> F["findGroups<br/>BFS over successors + predecessors, O(V+E)"]
+    G["Graph (directed or undirected)"] --> F["findGroups<br/>BFS over successors + predecessors, O(V+E)"]
     F --> C1["TaskGroup 0<br/>own subgraph copy"]
     F --> C2["TaskGroup 1<br/>own subgraph copy"]
     F --> C3["TaskGroup 2<br/>own subgraph copy"]
@@ -51,7 +51,9 @@ flowchart LR
     Z --> R
 ```
 
-- **Input:** a directed graph (undirected is rejected), weighted or not; weights reach each group's copy.
+- **Input:** a directed (unidirectional) or undirected (bidirectional) graph, weighted or not; each group's
+  copy keeps both. In ds an undirected graph's `successors` and `predecessors` are both a node's
+  neighbors, so the executors need no separate code path.
 - **Group = weakly connected component.** In `a -> c <- b`, a and b share c, so they are not
   independent. Strongly connected components would wrongly split them.
 - **Template method:** `execute`/`submit` are final; subclasses implement `processGroup` and may
@@ -252,6 +254,7 @@ the topological pair. Nothing about the topological pair changes.
 | A task fails | its dependants are skipped | nothing is blocked |
 | Distributed message | decrement `(v, -k)`: not idempotent, dedupe is required | visit `{v}`: idempotent, dedupe only saves work |
 | Rounds | longest chain + 1 | deepest shortest path + 1 (+ mark-only rounds past `maxDepth`) |
+| Undirected graph | every edge is a two-node cycle: groups with an edge are ineligible, isolated nodes run | edges are followed both ways; with the default roots each connected group starts at its first node (`startRootlessGroups`) |
 
 ```java
 new TraversalTaskExecutor<String>(groupPool, taskPool, IneligibleGroupPolicy.ISOLATE_GROUP) {
@@ -338,6 +341,12 @@ backend, and the adapter modules are the database ones:
 
 `InMemoryGraphStore.of(graph, shards, shardOf)` is the in-memory store. It is used by the tests, and for
 comparing a cluster run against the one-VM executors.
+
+A store is directed unless `GraphStore.isDirected()` says otherwise. `InMemoryGraphStore` reports its
+graph's; `AgeGraphStore` and `Neo4jGraphStore` take a `directed` constructor argument (default `true`).
+The loaders write an undirected graph's edges both ways, so the queries are the same. On an undirected
+store, `sources` are only the isolated nodes, so `Worker.traversal` needs explicit roots, and
+`Worker.topological` runs only the isolated nodes (every edge is a cycle).
 
 ### The protocol
 

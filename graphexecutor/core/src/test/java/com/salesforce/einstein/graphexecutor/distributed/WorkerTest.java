@@ -225,6 +225,76 @@ class WorkerTest {
         }
     }
 
+    /** The same nodes and edges, undirected. */
+    private static Graph<String> undirected(Graph<String> directed) {
+        Graph<String> g = Graph.undirected();
+        for (String node : directed.nodes()) {
+            g.addNode(node);
+            directed.successors(node).forEach(to -> g.addEdge(node, to));
+        }
+        return g;
+    }
+
+    @Test
+    void workersTraverseAnUndirectedStoreAsTheOneJvmExecutorDoes() {
+        Graph<String> g = undirected(random(5, 80, 90, false));
+        Set<String> roots = Set.of("n0", "n1");
+        TraversalReport<String> expected = new Traversal(roots).execute(g);
+
+        GraphStore<String> store = InMemoryGraphStore.of(g, SHARDS, BY_KEY);
+        assertFalse(store.isDirected());
+        try (InMemoryClusterStore cluster = new InMemoryClusterStore()) {
+            CompletionLog<String> log = new InMemoryCompletionLog<>();
+            Traversal executor = new Traversal(roots);
+            List<Worker<String>> workers = new ArrayList<>();
+            for (int w = 0; w < 3; w++) {
+                workers.add(Worker.traversal(executor, roots, store, log, NodeCodec.strings(), cluster, config("u", "w" + w)));
+            }
+            ClusterReport report = start(workers).get(0).join();
+
+            assertEquals(RunStatus.DONE, report.status());
+            assertEquals(expected.depth(), rounds(g, log));
+            assertTrue(expected.depth().size() > roots.size());
+            assertTrue(executor.runs.values().stream().allMatch(n -> n.get() == 1));
+
+            IllegalArgumentException noRoots = assertThrows(IllegalArgumentException.class, () -> Worker.traversal(
+                    executor, Set.of(), store, log, NodeCodec.strings(), cluster, config("v", "w")));
+            assertTrue(noRoots.getMessage().contains("explicit roots"));
+        }
+    }
+
+    @Test
+    void anUndirectedStoreRunsOnlyIsolatedNodesInDependencyOrder() {
+        Graph<String> g = Graph.undirected();
+        g.addEdge("a", "b");
+        g.addNode("solo");
+        CompletionLog<String> log = new InMemoryCompletionLog<>();
+        Topological executor = new Topological();
+        try (InMemoryClusterStore cluster = new InMemoryClusterStore()) {
+            ClusterReport report = Worker.topological(executor, InMemoryGraphStore.of(g, SHARDS, BY_KEY), log,
+                    NodeCodec.strings(), cluster, config("i", "w").withMaxShards(SHARDS)).run();
+
+            assertEquals(RunStatus.DONE, report.status());
+            assertEquals(Set.of("solo"), executor.runs.keySet());
+        }
+    }
+
+    @Test
+    void loadingAStoreKeepsItsDirection() {
+        Graph<String> g = Graph.undirected();
+        g.addEdge("a", "b");
+        g.addEdge("b", "c");
+        g.addEdge("c", "c");
+        g.addNode("solo");
+        Graph<String> loaded = GraphStore.load(InMemoryGraphStore.of(g, SHARDS, BY_KEY), 2);
+
+        assertFalse(loaded.isDirected());
+        assertEquals(g.nodes(), Set.copyOf(loaded.nodes()));
+        assertEquals(3, loaded.edgeCount());
+        assertEquals(Set.of("a", "c"), loaded.successors("b"));
+        assertTrue(GraphStore.load(InMemoryGraphStore.of(random(1, 10, 15, false), SHARDS, BY_KEY), 3).isDirected());
+    }
+
     @Test
     void aDeadWorkersShardsAreTakenOverAndReplayedWithoutRerunningLoggedTasks() {
         Graph<String> g = random(3, 50, 120, false);
