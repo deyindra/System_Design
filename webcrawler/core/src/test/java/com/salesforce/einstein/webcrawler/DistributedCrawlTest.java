@@ -10,8 +10,11 @@ import com.salesforce.einstein.webcrawler.model.CrawlJob;
 import com.salesforce.einstein.webcrawler.model.CrawlRequest;
 import com.salesforce.einstein.webcrawler.model.JobPage;
 import com.salesforce.einstein.webcrawler.model.JobStatus;
+import com.salesforce.einstein.webcrawler.model.LinkEdge;
 import com.salesforce.einstein.webcrawler.model.PageStatus;
 import com.salesforce.einstein.webcrawler.model.Scope;
+import com.salesforce.einstein.webcrawler.sitemap.InMemorySitemapGraphs;
+import com.salesforce.einstein.webcrawler.sitemap.SitemapGraphs;
 import com.salesforce.einstein.webcrawler.store.InMemoryContentStore;
 import com.salesforce.einstein.webcrawler.store.InMemoryJobStore;
 import com.salesforce.einstein.webcrawler.store.InMemoryPageStore;
@@ -21,6 +24,7 @@ import com.salesforce.einstein.webcrawler.url.TrapDetector;
 import com.salesforce.einstein.webcrawler.url.UrlNormalizer;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.HashMap;
@@ -51,12 +55,14 @@ class DistributedCrawlTest {
     private final InMemoryPageStore pages = new InMemoryPageStore();
     private final InMemoryContentStore contents = new InMemoryContentStore();
     private final UrlNormalizer normalizer = new UrlNormalizer(new ParamRules());
+    private final SitemapGraphs sitemaps = new InMemorySitemapGraphs(4);
 
     /** A node; the test closes it. */
     private CrawlEngine node(Frontier frontier, Fetcher fetcher, Duration politeness) {
         EngineConfig cfg = EngineConfig.defaults().withWorkers(4).withPoliteness(politeness)
                 .withRetryBackoff(Duration.ofMillis(1));
-        return new CrawlEngine(cfg, frontier, jobs, pages, contents, fetcher, normalizer, TrapDetector.defaults(), clock);
+        return new CrawlEngine(cfg, frontier, jobs, pages, contents, fetcher, normalizer, TrapDetector.defaults(), sitemaps,
+                clock);
     }
 
     private static String links(String... hrefs) {
@@ -141,6 +147,64 @@ class DistributedCrawlTest {
         }
     }
 
+    // ---------------------------------------------------------------- sitemap crawl across nodes
+
+    /**
+     * The sitemap's graph is loaded once, by the node that accepts the job, into the store every node reads; each
+     * node then follows the successors of the pages it fetches.
+     */
+    @Test void aSitemapJobIsSharedByAllNodes() throws Exception {
+        List<String> hosts = IntStream.range(0, 6).mapToObj(i -> "https://h" + i + ".com").toList();
+        StringBuilder xml = new StringBuilder("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\""
+                + " xmlns:nav=\"urn:webcrawler:sitemap-nav\"><url nav:root=\"true\"><loc>https://hub.com/</loc>");
+        hosts.forEach(h -> xml.append("<nav:link href=\"").append(h).append("/\"/>"));
+        xml.append("</url>");
+        for (String h : hosts) {
+            xml.append("<url><loc>").append(h).append("/</loc><nav:link href=\"").append(h).append("/1\"/></url>");
+            xml.append("<url><loc>").append(h).append("/1</loc><nav:link href=\"").append(h).append("/2\"/></url>");
+            web.page(h + "/", links("/", "/off-sitemap")).page(h + "/1", links("/1")).page(h + "/2", links("/2"));
+        }
+        web.page("https://hub.com/", links("/off-sitemap"));
+        web.asset("https://hub.com/nav.xml", "application/xml", xml.append("</urlset>").toString()
+                .getBytes(StandardCharsets.UTF_8));
+        Map<String, Set<String>> fetchedBy = new ConcurrentHashMap<>();
+        Function<String, Fetcher> watched = id -> req -> {
+            fetchedBy.computeIfAbsent(id, k -> ConcurrentHashMap.newKeySet()).add(req.url().toString());
+            try {
+                Thread.sleep(2);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return web.fetch(req);
+        };
+        PartitionedFrontier cluster = new PartitionedFrontier(16, clock);
+
+        try (CrawlEngine n0 = node(cluster.join("node-0"), watched.apply("node-0"), Duration.ZERO);
+             CrawlEngine n1 = node(cluster.join("node-1"), watched.apply("node-1"), Duration.ZERO);
+             CrawlEngine n2 = node(cluster.join("node-2"), watched.apply("node-2"), Duration.ZERO)) {
+            CountDownLatch finished = new CountDownLatch(1);     // after the graph is dropped, on whichever node
+            List.of(n0, n1, n2).forEach(n -> n.onFinished(j -> finished.countDown()));
+            CrawlJob job = n0.submit(CrawlRequest.builder("t1").sitemapUrl("https://hub.com/nav.xml")
+                    .maxDepth(3).respectRobots(false).build(), null);
+            CrawlJob done = n1.await(job.jobId(), Duration.ofSeconds(20));
+
+            assertEquals(JobStatus.COMPLETED, done.status());
+            assertEquals(1 + 6 * 3, jobs.stats(job.jobId()).pages());
+            assertEquals(1 + 1 + 6 * 3, web.totalHitsExcludingRobots(), "the sitemap, then every page exactly once");
+            for (String h : hosts) {
+                assertEquals(0, web.hits(h + "/off-sitemap"));
+                assertEquals(1, node(job, h + "/").depth());
+                assertEquals(3, node(job, h + "/2").depth());
+            }
+            assertTrue(fetchedBy.size() > 1, "work was spread: " + fetchedBy.keySet());
+            String h0 = normalizer.normalize(hosts.get(0) + "/").orElseThrow().hash();
+            assertEquals(Set.of(hosts.get(0) + "/", hosts.get(0) + "/off-sitemap", hosts.get(0) + "/1"),
+                    Set.copyOf(n2.jobs().outLinks(job.jobId(), h0).stream().map(LinkEdge::toUrl).toList()));
+            assertTrue(finished.await(10, TimeUnit.SECONDS));
+            assertFalse(sitemaps.exists("sitemap_" + job.jobId().replace("-", "")), "the job's graph is dropped once it is done");
+        }
+    }
+
     // ---------------------------------------------------------------- failure
 
     @Test void aNodeDyingMidFetchLosesNoWorkAndCountsNothingTwice() throws Exception {
@@ -184,7 +248,7 @@ class DistributedCrawlTest {
 
     // ---------------------------------------------------------------- graph: depth is a shortest path
 
-    /** The short path (via https://b.com/) arrives while {@code target} is being fetched on the long one. */
+    /** The short path (via {@code https://b.com/}) arrives while {@code target} is being fetched on the long one. */
     private Fetcher bExpandedWhileFetching(String target) {
         CountDownLatch targetStarted = new CountDownLatch(1);
         CountDownLatch bExpanded = new CountDownLatch(1);
@@ -209,8 +273,8 @@ class DistributedCrawlTest {
         };
     }
 
-    /** The short path (via https://b.com/) arrives only after {@code target} was fetched and expanded on the long one. */
-    private Fetcher bAfterExpanding(String target) {
+    /** The short path (via {@code https://b.com/}) arrives only after T was fetched and expanded on the long one. */
+    private Fetcher bAfterExpanding() {
         CountDownLatch targetFetched = new CountDownLatch(1);
         return req -> {
             String u = req.url().toString();
@@ -223,7 +287,7 @@ class DistributedCrawlTest {
                 }
             }
             FetchResult r = web.fetch(req);
-            if (u.equals(target)) targetFetched.countDown();
+            if (u.equals("https://t.com/")) targetFetched.countDown();
             return r;
         };
     }
@@ -263,7 +327,7 @@ class DistributedCrawlTest {
            .page("https://b.com/", links("https://t.com/"))
            .page("https://t.com/", links("/u"))
            .page("https://t.com/u", links("/"));
-        Fetcher slowB = bAfterExpanding("https://t.com/");
+        Fetcher slowB = bAfterExpanding();
         PartitionedFrontier cluster = new PartitionedFrontier(8, clock);
         try (CrawlEngine e1 = node(cluster.join("node-1"), slowB, Duration.ZERO);
              CrawlEngine ignored = node(cluster.join("node-2"), slowB, Duration.ZERO)) {

@@ -88,6 +88,7 @@ this design and how the design absorbs each one.
 | `HostSchedule` (politeness across a handover) | `InMemoryHostSchedule` | **built** · `RedisHostSchedule`, registered by the `redis-cql` module | no |
 | `PageStore` | `memory` | *planned* `cql` (`url_records`) | no |
 | `ContentStore` | `memory`, **`filesystem`** | `object-store`: one small class per provider (S3, GCS, Azure Blob), or the S3 API for MinIO/Ceph | **yes, the only one** |
+| `SitemapGraphs` (sitemap crawls) | `memory` (`InMemorySitemapGraphs`) | **built** · `age` (`AgeSitemapGraphs`), `neo4j` (`Neo4jSitemapGraphs`): one named graph per sitemap, read through graphexecutor's `GraphStore`, and a catalog of the graphs loaded through `/v1/sitemap-graphs` | no |
 | `Fetcher` | `HttpFetcher` behind `EgressFilteringFetcher` (SSRF check) | the same, plus an egress proxy or NAT with no internal routes | no |
 | *planned* `SignedUrls` | — | S3 presign / GCS signed URL / Azure SAS / a local HMAC-signed API link | yes |
 | *planned* `JobEvents` (job-done) | in-process listener | Redis pub/sub, or the outbox table | no |
@@ -104,13 +105,15 @@ be copied between providers with `rclone` or a storage transfer service, without
 webcrawler                     core: engine, API, ports, memory + filesystem adapters   (this module)
 webcrawler-adapter-kafka       built    Frontier over the Kafka API     → MSK, Event Hubs, GCP managed Kafka, Strimzi, Redpanda
 webcrawler-adapter-redis-cql   built    JobStore + HostSchedule over Redis + CQL + JDBC (PageStore planned)
-webcrawler-it                  built    two Spring Boot nodes on Kafka + Redis + Cassandra + Postgres (tests only)
+webcrawler-adapter-graph-age   built    SitemapGraphs (graphs + catalog) in Apache AGE (PostgreSQL)
+webcrawler-adapter-graph-neo4j built    SitemapGraphs (graphs + catalog) in Neo4j
+webcrawler-it                  built    two Spring Boot nodes on Kafka + Redis + Cassandra + Postgres/AGE (tests only)
 webcrawler-adapter-s3          planned  ContentStore + SignedUrls, AWS SDK v2 (also MinIO/Ceph via endpoint override)
 webcrawler-adapter-gcs         planned  ContentStore + SignedUrls, google-cloud-storage
 webcrawler-adapter-azure-blob  planned  ContentStore + SignedUrls, azure-storage-blob
 ```
 
-The two built adapters are configured under their own prefixes:
+The built adapters are configured under their own prefixes:
 
 | Property | Default | Notes |
 |---|---|---|
@@ -130,6 +133,9 @@ The two built adapters are configured under their own prefixes:
 | `crawler.redis-cql.create-schema` | `true` | creates the keyspace, tables and `crawl_jobs` if missing |
 | `crawler.redis-cql.hot-state-ttl` | `1d` | a finished job's Redis keys expire after this |
 | `crawler.redis-cql.job-cache-ttl` | `1s` | staleness of a running job's status on a node, which bounds how long a cancel takes to reach every worker |
+| `crawler.adapters.sitemap-graph` | `memory` | `age` or `neo4j` with the matching module; `crawler.sitemap.shards` (16) must match a bulk import's `shard`s; `crawler.sitemap.load-threads` (2) API loads at once per node |
+| `crawler.sitemap.age.url` / `user` / `password` / `pool-size` / `batch-size` | local Postgres / `postgres` / — / 8 / 1000 | |
+| `crawler.sitemap.neo4j.uri` / `user` / `password` / `database` / `batch-size` | `bolt://localhost:7687` / `neo4j` / — / `neo4j` / 500 | |
 
 > **Boot's Cassandra auto-configuration.** The CQL driver on the classpath activates Boot's
 > `CassandraAutoConfiguration`. When `job-store: redis-cql` is selected, this module's `CqlSession`
@@ -224,15 +230,16 @@ Helm chart is identical; only its values file differs.
   `InMemoryContentStoreTest` and `FileSystemContentStoreTest` extend it, and an S3 or GCS module
   adds one subclass. `JobStoreContract` (15 tests, including admit and close-task
   races under 16 and 8 threads) is extended by `InMemoryJobStoreTest` in the core and by
-  `RedisCqlJobStoreTest` on real Redis, Cassandra and Postgres. The core publishes these contracts
-  in its `test-jar`.
+  `RedisCqlJobStoreTest` on real Redis, Cassandra and Postgres. `SitemapGraphsContract` (9 tests) is
+  extended by `InMemorySitemapGraphsTest`, `AgeSitemapGraphsTest` and `Neo4jSitemapGraphsTest`. The
+  core publishes these contracts in its `test-jar`.
 - **The frontier** is tested by behaviour rather than by a contract class. `KafkaFrontierTest` runs
   the scenarios of `DistributedCrawlTest` on a real broker: three nodes in one group, a node
   killed mid-fetch, and a host's delay surviving its partition moving.
 - **End to end**: `TwoNodeCrawlTest` (`webcrawler-it`) starts the unchanged application twice and
-  selects the adapters by configuration only.
+  selects the adapters by configuration only, including sitemap jobs over AGE.
 - **Emulators** (Testcontainers) let adapters be tested without a cloud account. In use:
-  `cp-kafka`, `redis`, `cassandra`, `postgres`. For the planned adapters: MinIO or LocalStack (S3),
+  `cp-kafka`, `redis`, `cassandra`, `postgres`, `apache/age`, `neo4j`. For the planned adapters: MinIO or LocalStack (S3),
   fake-gcs-server (GCS), Azurite (Blob). The tests are skipped when Docker isn't available.
 - **Adapter selection**: `AdapterSelectionTest` proves a config value alone switches the
   implementation.

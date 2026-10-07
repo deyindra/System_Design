@@ -17,6 +17,8 @@
         <module>core</module>
         <module>adapter-kafka</module>
         <module>adapter-redis-cql</module>
+        <module>adapter-graph-age</module>
+        <module>adapter-graph-neo4j</module>
         <module>it</module>
     </modules>
 
@@ -58,6 +60,44 @@
                 <version>${project.version}</version>
                 <type>test-jar</type>
             </dependency>
+            <!-- Pure JDK; the GraphStore SPI that sitemap graphs are read through. -->
+            <dependency>
+                <groupId>com.salesforce.einstein</groupId>
+                <artifactId>core</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <!-- Sitemap graphs in a graph database (adapter-graph-*). The drivers at graphexecutor's
+                 versions, over Spring Boot's (an explicit entry wins over an imported BOM). -->
+            <dependency>
+                <groupId>org.postgresql</groupId>
+                <artifactId>postgresql</artifactId>
+                <version>42.7.7</version>
+            </dependency>
+            <dependency>
+                <groupId>org.neo4j.driver</groupId>
+                <artifactId>neo4j-java-driver</artifactId>
+                <version>5.28.15</version>
+            </dependency>
+            <dependency>
+                <groupId>com.salesforce.einstein</groupId>
+                <artifactId>graphexecutor-age</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.salesforce.einstein</groupId>
+                <artifactId>graphexecutor-neo4j</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.salesforce.einstein</groupId>
+                <artifactId>webcrawler-adapter-graph-age</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.salesforce.einstein</groupId>
+                <artifactId>webcrawler-adapter-graph-neo4j</artifactId>
+                <version>${project.version}</version>
+            </dependency>
             <dependency>
                 <groupId>com.salesforce.einstein</groupId>
                 <artifactId>webcrawler-adapter-kafka</artifactId>
@@ -72,6 +112,16 @@
     </dependencyManagement>
 
     <build>
+        <pluginManagement>
+            <plugins>
+                <!-- the version Spring Boot ${spring-boot.version} manages; core uses it for its test-jar -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-jar-plugin</artifactId>
+                    <version>3.4.2</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
         <plugins>
             <!-- -parameters: Spring binds @PathVariable/@RequestParam and record properties by parameter name. -->
             <plugin>

@@ -21,6 +21,10 @@ import com.salesforce.einstein.webcrawler.parse.CssParser;
 import com.salesforce.einstein.webcrawler.parse.ExtractedLink;
 import com.salesforce.einstein.webcrawler.parse.HtmlParser;
 import com.salesforce.einstein.webcrawler.parse.ParsedPage;
+import com.salesforce.einstein.webcrawler.sitemap.NavigationSitemap;
+import com.salesforce.einstein.webcrawler.sitemap.SitemapGraphRecord;
+import com.salesforce.einstein.webcrawler.sitemap.SitemapGraphs;
+import com.salesforce.einstein.webcrawler.sitemap.Sitemaps;
 import com.salesforce.einstein.webcrawler.store.Admission;
 import com.salesforce.einstein.webcrawler.store.ContentStore;
 import com.salesforce.einstein.webcrawler.store.JobStore;
@@ -29,6 +33,8 @@ import com.salesforce.einstein.webcrawler.url.BloomFilter;
 import com.salesforce.einstein.webcrawler.url.Hashing;
 import com.salesforce.einstein.webcrawler.url.TrapDetector;
 import com.salesforce.einstein.webcrawler.url.UrlNormalizer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -37,6 +43,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -64,8 +72,16 @@ import java.util.function.Consumer;
  *   <tr><td>already crawled</td><td>per job: seen-test; across jobs: fresh snapshot reuse or conditional GET</td></tr>
  *   <tr><td>images / video / audio</td><td>leaf nodes, depth not consumed, download per policy, content-addressed</td></tr>
  * </table>
+ *
+ * <p>A <b>sitemap crawl</b> ({@link CrawlRequest#isSitemap()}) takes its pages from a graph in {@link SitemapGraphs}
+ * instead of from the HTML: a fetched page's successors are read from the store and followed at depth+1, a
+ * streamed BFS that any node can continue, since the graph's name follows from the job. The HTML's page links are
+ * recorded but not followed; its assets are fetched as usual. The sitemap is the scope, so its pages skip the scope,
+ * trap and variant checks.
  */
 public final class CrawlEngine implements AutoCloseable {
+
+    private static final Logger log = LoggerFactory.getLogger(CrawlEngine.class);
 
     private final EngineConfig config;
     private final Frontier frontier;
@@ -76,6 +92,7 @@ public final class CrawlEngine implements AutoCloseable {
     private final RobotsCache robots;
     private final UrlNormalizer normalizer;
     private final TrapDetector traps;
+    private final SitemapGraphs sitemaps;
     private final HtmlParser parser = new HtmlParser();
     /** Negative cache in front of {@link PageStore}: "this URL was never crawled by anyone". */
     private final BloomFilter everCrawled = new BloomFilter(10_000_000, 0.01);
@@ -88,7 +105,8 @@ public final class CrawlEngine implements AutoCloseable {
     private volatile boolean running = true;
 
     public CrawlEngine(EngineConfig config, Frontier frontier, JobStore jobs, PageStore pages, ContentStore contents,
-                       Fetcher fetcher, UrlNormalizer normalizer, TrapDetector traps, Clock clock) {
+                       Fetcher fetcher, UrlNormalizer normalizer, TrapDetector traps, SitemapGraphs sitemaps,
+                       Clock clock) {
         this.config = config;
         this.frontier = frontier;
         this.jobs = jobs;
@@ -97,6 +115,7 @@ public final class CrawlEngine implements AutoCloseable {
         this.fetcher = fetcher;
         this.normalizer = normalizer;
         this.traps = traps;
+        this.sitemaps = sitemaps;
         this.clock = clock;
         this.robots = new RobotsCache(fetcher, clock, config.agentToken());
         jobs.onTerminal(j -> Optional.ofNullable(completions.remove(j.jobId())).ifPresent(f -> f.complete(j)));
@@ -113,11 +132,31 @@ public final class CrawlEngine implements AutoCloseable {
     /**
      * Validates, creates (or returns the idempotent twin of) a job, and enqueues its seeds. Never blocks on crawling:
      * this is the async boundary. {@link #await} is the optional synchronous wait on top of it.
+     *
+     * <p>A {@code sitemapUrl} is fetched and parsed here, before the job exists, so a bad one creates no job. Its
+     * graph is loaded once the job is created, under {@link #graphName}, and dropped when the job ends.
      */
     public CrawlJob submit(CrawlRequest req, String idempotencyKey) {
         req.validate();
+        if (req.maxPages() > config.maxPagesPerJob())
+            throw new IllegalArgumentException("maxPages: 1.." + config.maxPagesPerJob());
         List<CanonicalUrl> seeds = new ArrayList<>();
         for (String s : req.seeds()) normalizer.normalize(s).ifPresent(seeds::add);
+        if (seeds.isEmpty() && !req.seeds().isEmpty()) throw new IllegalArgumentException("no valid http(s) seed URL");
+        NavigationSitemap sitemap = null;
+        if (req.sitemapUrl() != null) {
+            sitemap = Sitemaps.fetch(fetcher, normalizer, req.sitemapUrl(), config.maxSitemapBytes());
+            if (sitemap.graph().nodeCount() == 0) throw new IllegalArgumentException("sitemap has no pages");
+            for (CanonicalUrl s : seeds)
+                if (!sitemap.graph().containsNode(s)) throw new IllegalArgumentException("seed not in the sitemap: " + s);
+            if (seeds.isEmpty())
+                seeds.addAll(sitemap.roots().isEmpty() ? sitemap.defaultRoots() : sitemap.roots());
+        } else if (req.sitemapGraph() != null) {
+            checkSitemapGraph(req);
+            Set<CanonicalUrl> known = sitemaps.open(req.sitemapGraph()).successors(seeds).keySet();
+            for (CanonicalUrl s : seeds)
+                if (!known.contains(s)) throw new IllegalArgumentException("seed not in sitemapGraph: " + s);
+        }
         if (seeds.isEmpty()) throw new IllegalArgumentException("no valid http(s) seed URL");
 
         CrawlJob fresh = new CrawlJob(UUID.randomUUID().toString(), req.tenantId(), idempotencyKey, req,
@@ -131,12 +170,15 @@ public final class CrawlEngine implements AutoCloseable {
 
         jobs.transition(job.jobId(), JobStatus.QUEUED, JobStatus.RUNNING, null);
         jobs.incrementPending(job.jobId());            // guard: the job can't complete while seeds are being added
+        String step = "load the sitemap";
         try {
+            if (sitemap != null) sitemaps.load(graphName(job.jobId(), req), sitemap.graph());
+            step = "enqueue seeds";
             for (CanonicalUrl s : seeds)
                 enqueue(new CrawlTask(job.jobId(), s, 0, null, ResourceType.PAGE, 0, 0), req.maxPages());
             frontier.flush();                          // the caller is told "accepted" only once the seeds are durable
         } catch (RuntimeException e) {
-            if (jobs.transition(job.jobId(), JobStatus.RUNNING, JobStatus.FAILED, "could not enqueue seeds: " + e))
+            if (jobs.transition(job.jobId(), JobStatus.RUNNING, JobStatus.FAILED, "could not " + step + ": " + e))
                 finished(job.jobId());
             throw e;
         }
@@ -292,8 +334,10 @@ public final class CrawlEngine implements AutoCloseable {
         // Content-seen test: the same bytes under another URL of this job (?sessionid=…, /index.html vs /).
         // Store a pointer and do not expand it again, otherwise every variant re-enqueues the same links.
         // The key includes the directory: identical bytes in /a/ and /b/ have different relative links, so both expand.
-        Optional<String> owner = jobs.claimContent(task.jobId(), contentKey(s.contentHash(), task.url()), task.url().hash());
+        // A sitemap page is not: the same bytes still have their own successors in the sitemap.
         CrawlRequest req = jobs.get(task.jobId()).orElseThrow().request();
+        Optional<String> owner = req.isSitemap() ? Optional.empty()
+                : jobs.claimContent(task.jobId(), contentKey(s.contentHash(), task.url()), task.url().hash());
         if (owner.isPresent()) {
             jobs.update(page.withContent(status, type, s).duplicateOf(owner.get()));
             relaxNode(task, owner.get(), task.depth(), req);             // the owner is now reachable this close too
@@ -319,15 +363,18 @@ public final class CrawlEngine implements AutoCloseable {
 
     /**
      * Turns a page's links into edges and tasks. {@code recordEdges} is false on a re-expansion: the edges are already
-     * stored, only the depth they are followed from changed.
+     * stored, only the depth they are followed from changed. In a sitemap crawl the page links are only recorded, and
+     * the pages followed are the sitemap's successors.
      */
     private void expand(CrawlTask task, byte[] html, CrawlRequest req, boolean recordEdges) {
         ParsedPage parsed = parser.parse(html, task.url().value());
         URI base = baseOf(parsed, task.url());
+        boolean sitemap = req.isSitemap();
+        Set<String> linked = new HashSet<>();
 
         // rel=canonical: the same page, so the same depth, but it costs a redirect hop, or A→B→C→… canonical
         // chains would walk the site without ever consuming depth.
-        if (parsed.canonical() != null && task.redirectHops() < config.maxRedirects())
+        if (!sitemap && parsed.canonical() != null && task.redirectHops() < config.maxRedirects())
             normalizer.normalize(base, parsed.canonical()).filter(c -> !c.hash().equals(task.url().hash()))
                     .ifPresent(c -> follow(task, c, task.depth(), task.redirectHops() + 1, req));
 
@@ -337,10 +384,28 @@ public final class CrawlEngine implements AutoCloseable {
                 Optional<CanonicalUrl> c = normalizer.normalize(base, link.raw());
                 if (c.isEmpty()) continue;
                 if (recordEdges) record(task, c.get(), link);
-                if (!parsed.noFollow()) follow(task, c.get(), task.depth() + 1, 0, req);
+                if (sitemap) linked.add(c.get().hash());
+                if (!sitemap && !parsed.noFollow()) follow(task, c.get(), task.depth() + 1, 0, req);
             } else if (recordEdges) {
                 addAsset(task, base, link.raw(), link.type());               // assets are leaves: depth doesn't matter
             }
+        }
+        if (sitemap) expandFromSitemap(task, req, recordEdges, linked);
+    }
+
+    /**
+     * The sitemap's successors of the task's page: pages at depth+1, assets as leaves. An edge the page's HTML
+     * already recorded ({@code linked}) is not recorded twice.
+     */
+    private void expandFromSitemap(CrawlTask task, CrawlRequest req, boolean recordEdges, Collection<String> linked) {
+        List<CanonicalUrl> next = sitemaps.open(graphName(task.jobId(), req)).successors(List.of(task.url()))
+                .getOrDefault(task.url(), List.of());
+        for (CanonicalUrl to : next) {
+            ResourceType type = ResourceType.guessFromPath(to.path());
+            if (recordEdges && !linked.contains(to.hash())) record(task, to, new ExtractedLink(to.value(), type));
+            if (type == ResourceType.PAGE) follow(task, to, task.depth() + 1, 0, req);
+            else if (recordEdges)
+                admitAsset(new CrawlTask(task.jobId(), to, task.depth(), task.url().hash(), type, 0, 0), req);
         }
     }
 
@@ -361,7 +426,11 @@ public final class CrawlEngine implements AutoCloseable {
                     contents.get(n.contentHash()).ifPresent(html -> expand(t.atDepth(n.depth()), html, req, false));
             }
             case DUPLICATE -> relaxNode(t, n.duplicateOf(), n.depth(), req);
-            case REDIRECT -> relaxNode(t, n.redirectTo(), n.depth(), req);   // a redirect is not a hop
+            case REDIRECT -> {
+                relaxNode(t, n.redirectTo(), n.depth(), req);            // a redirect is not a hop
+                if (req.isSitemap() && t.expectedType() == ResourceType.PAGE)
+                    expandFromSitemap(t.atDepth(n.depth()), req, false, List.of());
+            }
             default -> { }   // QUEUED: will run at the new depth (process() reads it); failures have no children
         }
     }
@@ -373,14 +442,17 @@ public final class CrawlEngine implements AutoCloseable {
                         depth, 0, req));
     }
 
-    /** A link to a page. The edge is already recorded; this decides whether it becomes a node. */
+    /**
+     * A link to a page. The edge is already recorded; this decides whether it becomes a node. In a sitemap crawl
+     * every link followed is the sitemap's, which is the scope, so only depth, budget and the seen-test apply.
+     */
     private void follow(CrawlTask parent, CanonicalUrl c, int depth, int hops, CrawlRequest req) {
         if (depth > req.maxDepth()) return;                              // too deep: edge kept, node not created
         // Cheap pre-check; admit() is the real test. A REFERENCED node (seen only as an embed) may still become a page.
         Optional<JobPage> known = jobs.page(parent.jobId(), c.hash()).filter(p -> p.status() != PageStatus.REFERENCED);
         if (known.isPresent()) {
             if (known.get().depth() <= depth) return;                    // already reached by a path this short
-        } else {
+        } else if (!req.isSitemap()) {
             if (outOfScope(parent.jobId(), req.scope(), c)) return;
             if (traps.check(c).isPresent()) return;
             if (!admitVariant(parent.jobId(), c)) return;
@@ -394,11 +466,15 @@ public final class CrawlEngine implements AutoCloseable {
         if (c.isEmpty()) return;
         ResourceType type = hint != null ? hint : assetType(c.get());
         record(parent, c.get(), new ExtractedLink(raw, type));
-        CrawlRequest req = jobs.get(parent.jobId()).orElseThrow().request();
-        CrawlTask t = new CrawlTask(parent.jobId(), c.get(), parent.depth(), parent.url().hash(), type, 0, 0);
-        if (req.downloadAssets().contains(type)) enqueue(t, req.maxAssets());
+        admitAsset(new CrawlTask(parent.jobId(), c.get(), parent.depth(), parent.url().hash(), type, 0, 0),
+                jobs.get(parent.jobId()).orElseThrow().request());
+    }
+
+    /** An asset task: fetched if its type is downloaded, else a {@link PageStatus#REFERENCED} node. */
+    private void admitAsset(CrawlTask t, CrawlRequest req) {
+        if (req.downloadAssets().contains(t.expectedType())) enqueue(t, req.maxAssets());
         else if (jobs.admit(JobPage.referenced(t), false, req.maxAssets()) == Admission.OVER_BUDGET)
-            jobs.markTruncated(parent.jobId());
+            jobs.markTruncated(t.jobId());
     }
 
     private void onRedirect(CrawlTask task, JobPage page, FetchResult r, CrawlRequest req, Instant now) {
@@ -409,15 +485,20 @@ public final class CrawlEngine implements AutoCloseable {
         }
         jobs.update(page.redirect(r.status(), target.get().hash(), now));
         record(task, target.get(), new ExtractedLink(r.location(), task.expectedType()));
+        boolean asset = task.expectedType().isAsset();
+        if (!asset && req.isSitemap()) expandFromSitemap(task, req, true, List.of());   // the sitemap knows this URL
         if (task.redirectHops() >= config.maxRedirects()) {
             jobs.update(page.failed(PageStatus.FAILED, r.status(), "too many redirects", now));
             return;
         }
-        // Same depth: a redirect is not a link hop. A loop (A→B→A) ends at the seen-test.
-        boolean asset = task.expectedType().isAsset();
+        // Same depth: a redirect is not a link hop. A loop (A→B→A) ends at the seen-test. In a sitemap crawl a page
+        // may redirect within its own scope (its host, under SAME_HOST), wherever the sitemap took the crawl.
         if (!asset && task.depth() == 0)        // a seed that redirects (example.com → www.example.com): the user
             jobs.addScopeKey(task.jobId(), scopeKey(req.scope(), target.get().host()));   // meant the destination
-        if (!asset && (outOfScope(task.jobId(), req.scope(), target.get()) || traps.check(target.get()).isPresent())) return;
+        boolean inScope = req.isSitemap()
+                && scopeKey(req.scope(), target.get().host()).equals(scopeKey(req.scope(), task.url().host()));
+        if (!asset && ((!inScope && outOfScope(task.jobId(), req.scope(), target.get()))
+                || traps.check(target.get()).isPresent())) return;
         enqueue(new CrawlTask(task.jobId(), target.get(), task.depth(), task.url().hash(), task.expectedType(),
                 task.redirectHops() + 1, 0), asset ? req.maxAssets() : req.maxPages());
         if (!asset) catchUp(task, req);
@@ -467,12 +548,43 @@ public final class CrawlEngine implements AutoCloseable {
         if (left == 0 && jobs.transition(jobId, JobStatus.RUNNING, JobStatus.COMPLETED, null)) finished(jobId);
     }
 
-    /** Runs once per job, on the node that won the terminal transition (so webhooks fire once). */
+    /**
+     * Runs once per job, on the node that won the terminal transition (so webhooks fire once). A {@code sitemapUrl}
+     * job's graph is dropped: nothing is pending, and its edges are in the job store. A named graph is kept.
+     */
     private void finished(String jobId) {
         CrawlJob job = jobs.get(jobId).orElseThrow();
+        if (job.request().sitemapUrl() != null) {
+            try {
+                sitemaps.drop(graphName(jobId, job.request()));
+            } catch (RuntimeException e) {
+                log.warn("could not drop the sitemap graph of job {}", jobId, e);
+            }
+        }
         for (Consumer<CrawlJob> l : listeners) {
             try { l.accept(job); } catch (RuntimeException ignored) { }
         }
+    }
+
+    /**
+     * A named graph must be there, and, if it was loaded through the API, be the tenant's and {@code READY}. Another
+     * tenant's graph reads as unknown, so names can't be probed.
+     */
+    private void checkSitemapGraph(CrawlRequest req) {
+        String name = req.sitemapGraph();
+        sitemaps.record(name).ifPresentOrElse(entry -> {
+            if (!entry.tenantId().equals(req.tenantId()))
+                throw new IllegalArgumentException("unknown sitemapGraph: " + name);
+            if (entry.status() != SitemapGraphRecord.Status.READY)
+                throw new IllegalArgumentException("sitemapGraph " + name + " is " + entry.status());
+        }, () -> {
+            if (!sitemaps.exists(name)) throw new IllegalArgumentException("unknown sitemapGraph: " + name);  // a bulk import
+        });
+    }
+
+    /** The job's sitemap graph: the named one, or the one loaded for it from {@code sitemapUrl}. */
+    static String graphName(String jobId, CrawlRequest req) {
+        return req.sitemapGraph() != null ? req.sitemapGraph() : CrawlRequest.JOB_GRAPH_PREFIX + jobId.replace("-", "");
     }
 
     private boolean outOfScope(String jobId, Scope scope, CanonicalUrl c) {

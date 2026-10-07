@@ -113,6 +113,31 @@ A redirect loop ends at the seen-test. `rel=canonical` is treated the same way: 
 When a **seed** redirects to another host (`example.com → www.example.com`), the destination joins
 the job's scope, since that is the site the user asked for.
 
+### 1.7 Sitemap crawls
+
+A request with `sitemapUrl` or `sitemapGraph` takes its pages from a navigation sitemap's graph
+instead of from the pages' links ([README](../README.md#sitemap-crawl-optional) has the format).
+
+- **Graph.** `sitemapUrl` is fetched at submit (through the egress-filtered fetcher, no robots, no
+  redirects, ≤ `crawler.max-sitemap-bytes`), parsed, and loaded into the `SitemapGraphs` store as
+  `sitemap_<jobId>`, dropped when the job ends. `sitemapGraph` names a graph already in the store
+  (loaded through `PUT /v1/sitemap-graphs/{name}`, §2.9, or bulk-imported), never dropped by a job.
+  A loaded graph is the loading tenant's, and must be `READY`; a bulk import has no owner. The store is
+  `memory`, `age` or `neo4j` (`crawler.adapters.sitemap-graph`) and is read through graphexecutor's
+  `GraphStore.successors`, so a 100B-page graph is never in one process.
+- **BFS.** The roots (the seeds; else the `nav:root` pages; else `NavigationSitemap.defaultRoots()`)
+  are enqueued at depth 0. A fetched HTML page, or a redirect, reads its successors from the store
+  and admits them at depth + 1, through the same `admit()`, budgets and `SHALLOWER` relaxation as
+  page links. `maxDepth` and `maxPages` bound the slice; `maxPages` ≤ `crawler.max-pages-per-job`.
+- **What is followed.** Only sitemap edges. HTML page links are recorded as edges, not followed;
+  `rel=canonical` is not followed; assets in the HTML and CSS are fetched as leaves, as in a seed
+  crawl. `scope`, traps and variant limits don't apply to sitemap edges; the content-seen test is
+  skipped, since equal bytes at two URLs still have different successors.
+- **Errors at submit are 400s with no job:** the sitemap can't be fetched or parsed, is too large or
+  empty; a seed isn't in it; the `sitemapGraph` doesn't exist; both fields are set.
+- **Distribution.** The request is stored with the job, and the graph name is a function of the job,
+  so any node's worker can expand any page of it.
+
 ---
 
 ## 2. API reference
@@ -130,6 +155,7 @@ Another tenant's job is **404**. Errors are `application/problem+json`:
 | `invalid-request` | 400 | bean validation, a bad seed, SYNC over its limits, an unknown `type` or `links` value |
 | `not-found` | 404 | no such job for this tenant; no such node; node has no content |
 | `idempotency-conflict` | 422 | the `Idempotency-Key` was used before with a different body |
+| `conflict` | 409 | a sitemap graph name already in use (§2.9) |
 | — | 409 | `export` before the job is terminal |
 | `internal` | 500 | anything else (generic body; details only in logs) |
 | *(prod)* `rate-limited` | 429 | per-tenant submit rate or concurrent-job quota, with `Retry-After` |
@@ -138,9 +164,11 @@ Another tenant's job is **404**. Errors are `application/problem+json`:
 
 | Field | Type | Default | Constraint |
 |---|---|---|---|
-| `seeds` | string[] | — | 1..100, each ≤ 2048 chars, http(s) |
+| `seeds` | string[] | — | 0..100, each ≤ 2048 chars, http(s). Required (≥ 1) unless `sitemapUrl` is set; with a sitemap, they are its roots and must be in it |
+| `sitemapUrl` | string | — | a navigation sitemap to crawl, http(s), ≤ 2048 chars; fetched and loaded for this job only ([§1.7](#17-sitemap-crawls)) |
+| `sitemapGraph` | string | — | a sitemap graph already in the store, `[A-Za-z_][A-Za-z0-9_]{2,62}`; at most one of the two sitemap fields |
 | `maxDepth` | int | 2 | 0..50; SYNC ≤ 1 |
-| `maxPages` | int | 1000 | 1..1,000,000; SYNC ≤ 25 |
+| `maxPages` | int | 1000 | 1..`crawler.max-pages-per-job` (default 1,000,000); SYNC ≤ 25 |
 | `maxAssets` | int | 5000 | ≥ 0 |
 | `scope` | enum | `SAME_HOST` | `SAME_HOST`, `SAME_DOMAIN` (registrable domain), `ANY` |
 | `downloadAssets` | enum[] | `[IMAGE, CSS]` | of `IMAGE, VIDEO, AUDIO, CSS, SCRIPT, FONT, DOCUMENT, OTHER`; `[]` = reference only |
@@ -166,7 +194,7 @@ original job; a different body is 422.
 {
   "jobId": "4c1f…", "status": "COMPLETED",
   "createdAt": "2026-10-03T10:00:00Z", "finishedAt": "2026-10-03T10:04:12Z",
-  "request": { "seeds": ["https://docs.example.com/"], "maxDepth": 3, "maxPages": 5000, "maxAssets": 20000,
+  "request": { "seeds": ["https://docs.example.com/"], "sitemapUrl": null, "sitemapGraph": null, "maxDepth": 3, "maxPages": 5000, "maxAssets": 20000,
                "scope": "SAME_HOST", "downloadAssets": ["IMAGE", "CSS"], "maxAssetBytes": 10485760,
                "maxAgeSeconds": 86400, "respectRobots": true, "mode": "ASYNC" },
   "stats": { "discovered": 412, "pending": 0, "pages": 180, "assets": 150, "reused": 40,
@@ -246,7 +274,27 @@ would tell one tenant what others crawl.
   "content": "/v1/crawls/6c1e…/pages/9f2c…/content" }
 ```
 
-### 2.9 Webhook
+### 2.9 `PUT | GET | DELETE /v1/sitemap-graphs/{name}` → `SitemapGraphView`
+
+A named sitemap graph for crawls that set `sitemapGraph`, owned by the tenant that loads it (another
+tenant's is a 404). `PUT {"sitemapUrl": …}` → **202** + `Location`; the sitemap is fetched, parsed and
+written in the background (`SitemapGraphService`, `crawler.sitemap.load-threads` per node). Repeating
+it (same tenant and URL) returns the entry, **200** once finished; a name in use is **409**; a name
+beginning `sitemap_` is a 400. `DELETE` → **204**, in any state.
+
+```json
+{ "name": "catalog", "status": "READY", "sitemapUrl": "https://example.com/nav.xml",
+  "createdAt": "2026-10-03T09:12:40Z", "finishedAt": "2026-10-03T09:12:44Z",
+  "pages": 18342, "edges": 51007, "roots": ["https://example.com/"], "rootCount": 1,
+  "links": { "self": "/v1/sitemap-graphs/catalog" } }
+```
+
+`status` is `LOADING`, `READY` (with `pages`, `edges`, `roots` ≤ 100 and `rootCount`) or `FAILED` (with
+`error`). The entry is kept in the graph store's catalog (`SitemapGraphs.register/record/update`), so
+every node answers for every graph; each load has a `loadId`, so a load that was deleted can't
+update the entry of a later one.
+
+### 2.10 Webhook
 
 On a terminal status we `POST callbackUrl` with the `JobView`. In production the body is signed
 `X-Signature: sha256=HMAC(tenant secret, body)` and delivered at-least-once from an outbox, with
@@ -537,8 +585,9 @@ The engine depends only on SPIs, so production swaps implementations without cha
   and assets.
 - **Near-duplicates:** a 64-bit SimHash over the visible text; Hamming distance ≤ 3 flags
   `NEAR_DUPLICATE` without dropping the page.
-- **Sitemaps:** `RobotsRules.sitemaps()` already parses them. Enqueue sitemap URLs at depth 1 for
-  discovery without crawling every index page.
+- **Sitemap discovery:** `RobotsRules.sitemaps()` already parses robots' `Sitemap:` lines. Crawling
+  a navigation sitemap the caller names is built ([§1.7](#17-sitemap-crawls)); finding one from
+  `robots.txt` is not.
 - **Continuous recrawl:** adaptive `next_fetch_at` (halve the interval on change, double it
   otherwise, clamped to 1 h–30 d), with a scheduler feeding `frontier.p2`.
 - **WARC output:** export to WARC/WACZ for archive tooling, and replay with a client-side rewrite

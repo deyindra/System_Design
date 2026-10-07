@@ -39,10 +39,6 @@ public abstract class TrendStoreContractTest {
                 List.of(tagIds), "alice", at);
     }
 
-    private TagEvent deleted(String tenant, long tagId) {
-        return new TagEvent(++seq, "s0", tenant, TagEvent.Type.TAG_DELETED, tagId, null, null, 0, List.of(), "alice", NOW);
-    }
-
     /** The 24 h window ending at {@link #NOW}. */
     private List<TagCount> day(String tenant, TrendRank rank, int limit) {
         long last = TrendWindow.bucket(NOW, H);
@@ -114,7 +110,8 @@ public abstract class TrendStoreContractTest {
     @DisplayName("a deleted tag's counters are dropped")
     void deleteDropsCounters() {
         store.record("s0", List.of(attached(T1, NOW, 1L, 2L)));
-        store.record("s0", List.of(deleted(T1, 1L)));
+        store.record("s0", List.of(new TagEvent(++seq, "s0", T1, TagEvent.Type.TAG_DELETED, 1, null, null, 0,
+                List.of(), "alice", NOW)));
         assertThat(day(T1, TrendRank.POPULAR, 10)).extracting(TagCount::tagId).containsExactly(2L);
     }
 

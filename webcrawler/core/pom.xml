@@ -45,6 +45,12 @@
             <version>${jsoup.version}</version>
         </dependency>
 
+        <!-- Sitemap navigation crawl only (package sitemap): the generic BFS executors, local and distributed. -->
+        <dependency>
+            <groupId>com.salesforce.einstein</groupId>
+            <artifactId>core</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

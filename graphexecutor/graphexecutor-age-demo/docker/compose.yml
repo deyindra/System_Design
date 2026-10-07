@@ -1,0 +1,44 @@
+# A demo cluster: AGE, a job that loads a random graph, and workers that traverse it.
+#   mvn -q -pl graphexecutor/graphexecutor-age-demo -am package -DskipTests      (from System_Design)
+#   docker compose -f graphexecutor/graphexecutor-age-demo/docker/compose.yml up --scale worker=3
+#   docker kill <one worker>         # the others take its shards over; the run still finishes
+x-db: &db
+  DB_URL: jdbc:postgresql://age:5432/postgres
+  DB_USER: postgres
+  DB_PASSWORD: postgres
+  GRAPH: demo
+  SHARDS: "6"
+
+services:
+  age:
+    image: apache/age:release_PG16_1.5.0
+    environment:
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      retries: 30
+
+  loader:
+    build: { context: .., dockerfile: src/main/docker/Dockerfile }
+    image: graphexecutor-age-demo
+    command: ["com.salesforce.einstein.graphexecutor.age.demo.RandomGraph"]
+    environment:
+      <<: *db
+      NODES: "2000"
+      EDGES: "6000"
+    depends_on:
+      age: { condition: service_healthy }
+
+  worker:
+    image: graphexecutor-age-demo
+    environment:
+      <<: *db
+      RUN_ID: demo-1
+      WORKER_FACTORY: com.salesforce.einstein.graphexecutor.age.demo.RecordingTraversal
+      ROOTS: n0
+      TASK_TIME: PT0.02S
+      SHARDS_PER_WORKER: "2"
+      LEASE_TTL: PT5S
+    depends_on:
+      loader: { condition: service_completed_successfully }

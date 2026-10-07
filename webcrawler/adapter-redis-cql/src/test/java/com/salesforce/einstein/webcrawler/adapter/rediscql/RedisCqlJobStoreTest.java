@@ -2,7 +2,6 @@ package com.salesforce.einstein.webcrawler.adapter.rediscql;
 
 import com.datastax.oss.driver.api.core.CqlSession;
 import com.salesforce.einstein.webcrawler.JobStoreContract;
-import com.salesforce.einstein.webcrawler.frontier.HostSchedule;
 import com.salesforce.einstein.webcrawler.model.CrawlJob;
 import com.salesforce.einstein.webcrawler.model.CrawlRequest;
 import com.salesforce.einstein.webcrawler.model.JobStatus;
@@ -33,11 +32,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @Testcontainers(disabledWithoutDocker = true)
 class RedisCqlJobStoreTest extends JobStoreContract {
 
-    @Container static final GenericContainer<?> REDIS = new GenericContainer<>("redis:7").withExposedPorts(6379);
+    @Container static final GenericContainer<?> REDIS = new GenericContainer<>("redis:7");
+    static { REDIS.addExposedPort(6379); }
     /** Ready when CQL is up; the default strategy polls with cqlsh and logs every refused attempt as an ERROR. */
-    @Container static final CassandraContainer CASSANDRA = new CassandraContainer("cassandra:4.1")
-            .waitingFor(Wait.forLogMessage(".*Starting listening for CQL clients.*", 1)
-                    .withStartupTimeout(Duration.ofMinutes(3)));
+    @Container static final CassandraContainer CASSANDRA = new CassandraContainer("cassandra:4.1");
+    static {
+        CASSANDRA.setWaitStrategy(Wait.forLogMessage(".*Starting listening for CQL clients.*", 1)
+                .withStartupTimeout(Duration.ofMinutes(3)));
+    }
     @Container static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine");
 
     private static RedisClient redis;
@@ -85,8 +87,8 @@ class RedisCqlJobStoreTest extends JobStoreContract {
 
     @Test void hostScheduleIsSharedAndExpires() throws Exception {
         Clock clock = Clock.systemUTC();
-        try (RedisHostSchedule a = new RedisHostSchedule(redis, clock); RedisHostSchedule b = new RedisHostSchedule(redis, clock)) {
-            HostSchedule writer = a, reader = b;
+        try (RedisHostSchedule writer = new RedisHostSchedule(redis, clock);
+             RedisHostSchedule reader = new RedisHostSchedule(redis, clock)) {
             String host = "h-" + UUID.randomUUID() + ".com";
             Instant at = Instant.ofEpochMilli(clock.millis() + 300);
             writer.put(host, at);

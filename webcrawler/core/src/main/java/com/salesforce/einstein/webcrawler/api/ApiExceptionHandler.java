@@ -1,6 +1,7 @@
 package com.salesforce.einstein.webcrawler.api;
 
 import com.salesforce.einstein.webcrawler.engine.IdempotencyConflictException;
+import com.salesforce.einstein.webcrawler.sitemap.SitemapGraphConflictException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -31,6 +32,12 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
     @ExceptionHandler(IdempotencyConflictException.class)
     ResponseEntity<ProblemDetail> idempotency(IdempotencyConflictException e) {
         return problem(HttpStatus.UNPROCESSABLE_ENTITY, "idempotency-conflict", e.getMessage());
+    }
+
+    /** The sitemap graph name is taken. */
+    @ExceptionHandler(SitemapGraphConflictException.class)
+    ResponseEntity<ProblemDetail> conflict(SitemapGraphConflictException e) {
+        return problem(HttpStatus.CONFLICT, "conflict", e.getMessage());
     }
 
     @ExceptionHandler(Exception.class)

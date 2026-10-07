@@ -1,0 +1,44 @@
+# A demo cluster: Neo4j, a job that loads a random graph, and workers that traverse it.
+#   mvn -q -pl graphexecutor/graphexecutor-neo4j-demo -am package -DskipTests      (from System_Design)
+#   docker compose -f graphexecutor/graphexecutor-neo4j-demo/docker/compose.yml up --scale worker=3
+#   docker kill <one worker>         # the others take its shards over; the run still finishes
+x-db: &db
+  NEO4J_URI: bolt://neo4j:7687
+  NEO4J_USER: neo4j
+  NEO4J_PASSWORD: graphexecutor
+  GRAPH: Demo
+  SHARDS: "6"
+
+services:
+  neo4j:
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: neo4j/graphexecutor
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "graphexecutor", "RETURN 1"]
+      interval: 3s
+      retries: 40
+
+  loader:
+    build: { context: .., dockerfile: src/main/docker/Dockerfile }
+    image: graphexecutor-neo4j-demo
+    command: ["com.salesforce.einstein.graphexecutor.neo4j.demo.RandomGraph"]
+    environment:
+      <<: *db
+      NODES: "2000"
+      EDGES: "6000"
+    depends_on:
+      neo4j: { condition: service_healthy }
+
+  worker:
+    image: graphexecutor-neo4j-demo
+    environment:
+      <<: *db
+      RUN_ID: demo-1
+      WORKER_FACTORY: com.salesforce.einstein.graphexecutor.neo4j.demo.RecordingTraversal
+      ROOTS: n0
+      TASK_TIME: PT0.02S
+      SHARDS_PER_WORKER: "2"
+      LEASE_TTL: PT5S
+    depends_on:
+      loader: { condition: service_completed_successfully }

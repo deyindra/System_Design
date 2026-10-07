@@ -1,6 +1,6 @@
 package com.salesforce.einstein.scheduler.store;
 
-import com.salesforce.einstein.ds.IndexedPriorityQueue;
+import com.salesforce.einstein.ds.queue.IndexedPriorityQueue;
 import com.salesforce.einstein.scheduler.spi.FinishResult;
 import com.salesforce.einstein.scheduler.spi.Outcome;
 import com.salesforce.einstein.scheduler.spi.RemoveResult;

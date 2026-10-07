@@ -11,7 +11,7 @@ The same scheduler runs in two modes. Only the **task store** behind it changes:
 
 | Mode | Store | Where tasks live | Use it when |
 |---|---|---|---|
-| **Single VM** (default) | `InMemoryTaskStore` | Inside the process, in [`IndexedPriorityQueue`](../../ds/README.md)s | One process owns the work; nothing needs to survive a restart. |
+| **Single VM** (default) | `InMemoryTaskStore` | Inside the process, in [`IndexedPriorityQueue`](../../ds/PriorityQueue.md)s | One process owns the work; nothing needs to survive a restart. |
 | **Multi VM** | `JdbcTaskStore` (or any shared `TaskStore`) | A database shared by every node | Several processes share the work; tasks must survive a node dying. |
 
 Both modes use the same engine (dispatcher, worker pool, timeout watchdog), the same state machine

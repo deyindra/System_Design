@@ -11,6 +11,7 @@ import com.salesforce.einstein.webcrawler.model.CrawlJob;
 import com.salesforce.einstein.webcrawler.model.CrawlRequest;
 import com.salesforce.einstein.webcrawler.model.JobStatus;
 import com.salesforce.einstein.webcrawler.model.Scope;
+import com.salesforce.einstein.webcrawler.sitemap.InMemorySitemapGraphs;
 import com.salesforce.einstein.webcrawler.store.InMemoryContentStore;
 import com.salesforce.einstein.webcrawler.store.InMemoryJobStore;
 import com.salesforce.einstein.webcrawler.store.InMemoryPageStore;
@@ -38,6 +39,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.stream.IntStream;
 
 import static org.awaitility.Awaitility.await;
@@ -86,7 +88,8 @@ class KafkaFrontierTest {
     private CrawlEngine engine(KafkaFrontier f, Fetcher fetcher, Duration politeness) {
         EngineConfig cfg = EngineConfig.defaults().withWorkers(4).withPoliteness(politeness)
                 .withRetryBackoff(Duration.ofMillis(1));
-        CrawlEngine e = new CrawlEngine(cfg, f, jobs, pages, contents, fetcher, normalizer, TrapDetector.defaults(), clock);
+        CrawlEngine e = new CrawlEngine(cfg, f, jobs, pages, contents, fetcher, normalizer, TrapDetector.defaults(),
+                new InMemorySitemapGraphs(4), clock);
         engines.add(e);
         return e;
     }
@@ -128,40 +131,44 @@ class KafkaFrontierTest {
         Map<String, AtomicInteger> active = new ConcurrentHashMap<>();
         AtomicBoolean overlap = new AtomicBoolean();
 
-        KafkaFrontier[] fs = new KafkaFrontier[3];
-        for (int n = 0; n < 3; n++) fs[n] = frontier("node-" + n);
-        awaitBalanced(fs);
-        for (int n = 0; n < 3; n++) {
-            String id = "node-" + n;
-            engine(fs[n], req -> {
-                String host = req.url().getHost();
-                nodesPerHost.computeIfAbsent(host, k -> ConcurrentHashMap.newKeySet()).add(id);
-                AtomicInteger a = active.computeIfAbsent(host, k -> new AtomicInteger());
-                if (a.incrementAndGet() > 1) overlap.set(true);
-                try {
-                    return web.fetch(req);
-                } finally {
-                    a.decrementAndGet();
+        Function<String, Fetcher> watched = id -> req -> {          // records which node fetched each host, and overlaps
+            String host = req.url().getHost();
+            nodesPerHost.computeIfAbsent(host, k -> ConcurrentHashMap.newKeySet()).add(id);
+            AtomicInteger a = active.computeIfAbsent(host, k -> new AtomicInteger());
+            if (a.incrementAndGet() > 1) overlap.set(true);
+            try {
+                return web.fetch(req);
+            } finally {
+                a.decrementAndGet();
+            }
+        };
+
+        try (KafkaFrontier f0 = frontier("node-0"); KafkaFrontier f1 = frontier("node-1");
+             KafkaFrontier f2 = frontier("node-2")) {
+            KafkaFrontier[] fs = {f0, f1, f2};
+            awaitBalanced(fs);
+            Duration politeness = Duration.ofMillis(5);
+            try (CrawlEngine e0 = engine(f0, watched.apply("node-0"), politeness);
+                 CrawlEngine e1 = engine(f1, watched.apply("node-1"), politeness);
+                 CrawlEngine e2 = engine(f2, watched.apply("node-2"), politeness)) {
+                CrawlJob job = e0.submit(CrawlRequest.builder("t1", "https://hub.com/")
+                        .scope(Scope.ANY).maxDepth(2).respectRobots(false).build(), null);
+                CrawlJob done = e2.await(job.jobId(), Duration.ofSeconds(60));
+
+                assertEquals(JobStatus.COMPLETED, done.status());
+                assertEquals(1 + 8 * 4, e1.jobs().stats(job.jobId()).pages(), "read on a third node");
+                assertEquals(1 + 8 * 4, web.totalHitsExcludingRobots(), "every page fetched exactly once, cluster-wide");
+                nodesPerHost.forEach((h, ns) -> assertEquals(1, ns.size(), h + " was fetched by " + ns));
+                assertTrue(nodesPerHost.values().stream().flatMap(Set::stream).distinct().count() > 1, "work was spread");
+                assertFalse(overlap.get(), "no host had two requests in flight");
+                for (String h : hosts) {
+                    String host = h.substring("https://".length());
+                    String owner = nodesPerHost.get(host).iterator().next();
+                    int partition = f0.partitionOf(host);
+                    assertTrue(fs[Integer.parseInt(owner.substring(5))].partitions().contains(partition),
+                            host + " was crawled by the owner of its partition");
                 }
-            }, Duration.ofMillis(5));
-        }
-
-        CrawlJob job = engines.get(0).submit(CrawlRequest.builder("t1", "https://hub.com/")
-                .scope(Scope.ANY).maxDepth(2).respectRobots(false).build(), null);
-        CrawlJob done = engines.get(2).await(job.jobId(), Duration.ofSeconds(60));
-
-        assertEquals(JobStatus.COMPLETED, done.status());
-        assertEquals(1 + 8 * 4, jobs.stats(job.jobId()).pages());
-        assertEquals(1 + 8 * 4, web.totalHitsExcludingRobots(), "every page fetched exactly once, cluster-wide");
-        nodesPerHost.forEach((h, ns) -> assertEquals(1, ns.size(), h + " was fetched by " + ns));
-        assertTrue(nodesPerHost.values().stream().flatMap(Set::stream).distinct().count() > 1, "work was spread");
-        assertFalse(overlap.get(), "no host had two requests in flight");
-        for (String h : hosts) {
-            String host = h.substring("https://".length());
-            String owner = nodesPerHost.get(host).iterator().next();
-            int partition = fs[0].partitionOf(host);
-            assertTrue(fs[Integer.parseInt(owner.substring(5))].partitions().contains(partition),
-                    host + " was crawled by the owner of its partition");
+            }
         }
     }
 

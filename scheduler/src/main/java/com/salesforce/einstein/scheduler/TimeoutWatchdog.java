@@ -1,6 +1,6 @@
 package com.salesforce.einstein.scheduler;
 
-import com.salesforce.einstein.ds.IndexedPriorityQueue;
+import com.salesforce.einstein.ds.queue.IndexedPriorityQueue;
 
 import java.util.Comparator;
 import java.util.HashMap;

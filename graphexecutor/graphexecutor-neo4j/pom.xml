@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.salesforce.einstein</groupId>
+        <artifactId>graphexecutor-parent</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <!-- A graph in Neo4j, processed by workers on many VMs; the run's shared state is in the same database.
+         The demo and its Docker ITs are in graphexecutor-neo4j-demo. -->
+    <artifactId>graphexecutor-neo4j</artifactId>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.salesforce.einstein</groupId>
+            <artifactId>core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.neo4j.driver</groupId>
+            <artifactId>neo4j-java-driver</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- a fixed name, like the demo and crawler modules' jars -->
+        <finalName>${project.artifactId}</finalName>
+    </build>
+
+</project>

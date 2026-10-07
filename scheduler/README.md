@@ -158,7 +158,7 @@ flowchart LR
 | **One dispatcher sleeping on a `Condition` with a timeout** | No busy polling. Wakes exactly when work is due or something changed | One timer thread per task: doesn't scale. Polling every *x* ms: latency vs CPU |
 | **Next recurring run computed from the *finish* time** (fixed delay) | With `timeout < period`, runs can never overlap, and a slow job back-pressures itself | Fixed rate: start times don't drift, but runs can pile up after a stall |
 
-> "In the real code the ready queue is the `IndexedPriorityQueue` from [../ds](../ds/README.md),
+> "In the real code the ready queue is the `IndexedPriorityQueue` from [../ds](../ds/PriorityQueue.md),
 > the same O(log N) cancel and re-key with heap constants. On the whiteboard `TreeSet` gives the
 > same complexity with no extra code."
 
@@ -819,7 +819,7 @@ classDiagram
 ```
 
 `InMemoryTaskStore` keeps a ready queue and a blacklist, both `IndexedPriorityQueue`s
-([../ds](../ds/README.md)), behind one lock. `JdbcTaskStore` runs each method in one database transaction.
+([../ds](../ds/PriorityQueue.md)), behind one lock. `JdbcTaskStore` runs each method in one database transaction.
 
 ---
 

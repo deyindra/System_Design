@@ -53,7 +53,8 @@ public abstract class JobStoreContract {
     private final String tenant = "t-" + UUID.randomUUID();
 
     private CrawlJob newJob(String idempotencyKey) {
-        CrawlRequest req = CrawlRequest.builder(tenant, "https://a.com/").scope(Scope.SAME_DOMAIN).maxDepth(3)
+        CrawlRequest req = CrawlRequest.builder(tenant, "https://a.com/").sitemapUrl("https://a.com/nav.xml")
+                .scope(Scope.SAME_DOMAIN).maxDepth(3)
                 .maxAge(Duration.ofMinutes(5)).callbackUrl("https://hooks.example/x").build();
         return new CrawlJob(UUID.randomUUID().toString(), tenant, idempotencyKey, req, JobStatus.QUEUED,
                 Instant.now().truncatedTo(ChronoUnit.MILLIS), null, null);

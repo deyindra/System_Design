@@ -614,8 +614,11 @@ fetched. So "extract first, then schedule" means fetching every page to learn th
 is the crawl itself. Done one level at a time it becomes "fetch level k, extract, schedule level
 k+1", which is exactly the BFS the frontier already does. Sorting adds nothing on top.
 
-Sometimes part of the graph *is* known up front: a `sitemap.xml`, or the previous run of a
-recurring job. Even then we just enqueue those URLs, because of point 2.
+Sometimes part of the graph *is* known up front: a navigation sitemap, or the previous run of a
+recurring job. Even then we don't sort it, because of point 2. A **sitemap crawl** (`sitemapUrl` or
+`sitemapGraph`) takes the edges from a graph store instead of from the pages' HTML, and still
+walks them breadth-first through the same frontier: a fetched page enqueues its sitemap
+successors at depth + 1.
 
 **2. Even with the whole graph, an edge is not a dependency.** `A → B` means "A mentions B". To
 fetch B we need only B's URL, which we have the moment A is parsed. B never waits for A to
@@ -1266,8 +1269,9 @@ queue. When the host's token bucket allows, it fetches, stores the blob, and pub
 
 - **Politeness is the bottleneck:** at 1 rps, 10M pages take 115 days. The levers: robots
   `Crawl-delay` (if lower), a **verified-owner fast lane** (the tenant proves ownership with a DNS
-  TXT record, and we allow N concurrent connections), **sitemaps** for discovery without crawling
-  every list page, and `maxAgeSeconds` reuse for unchanged pages (304s are cheap).
+  TXT record, and we allow N concurrent connections), **a sitemap graph** (AGE or Neo4j) so the pages
+  are known without crawling every list page, crawled as bounded slices (`seeds` + `maxDepth` +
+  `maxPages` per job), and `maxAgeSeconds` reuse for unchanged pages (304s are cheap).
 - **The hot partition:** one host is one partition, and its back queue would hold millions of
   tasks. The fetcher **spills** the per-host queue to local disk and **pauses** the log
   partition (backpressure) rather than buffering in heap.

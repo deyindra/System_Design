@@ -16,6 +16,8 @@ crawler:
   connect-timeout: 5s
   fetch-timeout: 30s
   max-sync-wait: 30s
+  max-pages-per-job: 1000000 # the largest maxPages a request may ask for; above this, use job-store: redis-cql
+  max-sitemap-bytes: 52428800  # 50 MiB, the sitemaps.org limit for a sitemapUrl file
   # Which implementation backs each port. Provider modules add their own values (see docs/PORTABILITY.md).
   adapters:
     frontier: memory
@@ -23,10 +25,14 @@ crawler:
     page-store: memory
     content-store: memory    # memory | filesystem
     content-root: ./data/blobs
+    sitemap-graph: memory    # memory | age | neo4j (with webcrawler-adapter-graph-age / -neo4j)
   # SSRF guard for every fetch and webhook: public addresses on these ports only.
   egress:
     allow-private: false     # true only for local development against private-network sites
     ports: [80, 443, 8080, 8443]
+  # Sitemap graphs; a store module reads its connection under crawler.sitemap.<age|neo4j>.
+  sitemap:
+    shards: 16               # a graph loaded from a sitemapUrl is sharded by host into this many shards
 management:
   endpoints:
     web:

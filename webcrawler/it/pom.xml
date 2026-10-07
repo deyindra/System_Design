@@ -9,8 +9,15 @@
         <version>1.0-SNAPSHOT</version>
     </parent>
 
-    <!-- End to end: two Spring Boot nodes on Kafka + Redis + Cassandra + Postgres, wired only by configuration. -->
+    <!-- End to end: two Spring Boot nodes on Kafka + Redis + Cassandra + Postgres, wired only by configuration,
+         with sitemap graphs in Apache AGE (the same Postgres). -->
     <artifactId>webcrawler-it</artifactId>
+
+    <!-- tests only: no jar to build, so none to install or deploy -->
+    <properties>
+        <maven.install.skip>true</maven.install.skip>
+        <maven.deploy.skip>true</maven.deploy.skip>
+    </properties>
 
     <dependencies>
         <dependency>
@@ -21,6 +28,12 @@
         <dependency>
             <groupId>com.salesforce.einstein</groupId>
             <artifactId>webcrawler-adapter-redis-cql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- TwoNodeCrawlTest: sitemap jobs over sitemap graphs in AGE -->
+        <dependency>
+            <groupId>com.salesforce.einstein</groupId>
+            <artifactId>webcrawler-adapter-graph-age</artifactId>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -55,5 +68,31 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <skipIfEmpty>true</skipIfEmpty>
+                </configuration>
+            </plugin>
+            <!-- *IT: after package, so the adapter modules' jars and target/lib (the images' contents) exist -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <version>3.5.2</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
 
 </project>

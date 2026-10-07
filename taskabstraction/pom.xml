@@ -10,6 +10,8 @@
     </parent>
 
     <artifactId>taskabstraction</artifactId>
+    <!-- no sources yet: pom until there is something to put in a jar -->
+    <packaging>pom</packaging>
 
     <properties>
         <maven.compiler.source>17</maven.compiler.source>

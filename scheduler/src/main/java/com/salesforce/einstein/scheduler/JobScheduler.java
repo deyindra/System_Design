@@ -1,5 +1,6 @@
 package com.salesforce.einstein.scheduler;
 
+import com.salesforce.einstein.ds.queue.IndexedPriorityQueue;
 import com.salesforce.einstein.scheduler.spi.FinishResult;
 import com.salesforce.einstein.scheduler.spi.Outcome;
 import com.salesforce.einstein.scheduler.spi.RemoveResult;
@@ -38,7 +39,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * and a {@link TimeoutWatchdog}) is the same in both modes. Where tasks live is a pluggable
  * {@link TaskStore}:
  * <ul>
- *   <li>{@link InMemoryTaskStore} (default) — single VM, {@link com.salesforce.einstein.ds.IndexedPriorityQueue}
+ *   <li>{@link InMemoryTaskStore} (default) — single VM, {@link IndexedPriorityQueue}
  *       based, nothing leaves the process;</li>
  *   <li>{@link com.salesforce.einstein.scheduler.store.JdbcTaskStore} — multi-VM: every node points at
  *       the same database and claims due tasks with a lease and a fencing token;</li>

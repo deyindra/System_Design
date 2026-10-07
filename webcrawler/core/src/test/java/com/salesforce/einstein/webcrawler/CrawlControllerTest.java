@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.salesforce.einstein.webcrawler.fetch.Fetcher;
 import org.junit.jupiter.api.Test;
+
+import java.nio.charset.StandardCharsets;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -37,7 +39,10 @@ class CrawlControllerTest {
                     .page(S + "/", "<a href='/a'>a</a><a href='/b?utm_source=x'>b</a><img src='/logo.png'>")
                     .page(S + "/a", "<a href='/'>home</a>")
                     .page(S + "/b", "<p>b</p>")
-                    .asset(S + "/logo.png", "image/png", new byte[]{1, 2, 3});
+                    .asset(S + "/logo.png", "image/png", new byte[]{1, 2, 3})
+                    .asset(S + "/nav.xml", "application/xml", ("<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'"
+                            + " xmlns:nav='urn:webcrawler:sitemap-nav'><url nav:root='true'><loc>" + S + "/</loc>"
+                            + "<nav:link href='/a'/></url></urlset>").getBytes(StandardCharsets.UTF_8));
         }
     }
 
@@ -92,6 +97,34 @@ class CrawlControllerTest {
         mvc.perform(get("/v1/crawls/" + id + "/pages").param("type", "image").header("X-Tenant-Id", "t1"))
                 .andExpect(status().isOk());
         mvc.perform(get("/v1/crawls/" + id).header("X-Tenant-Id", "someone-else")).andExpect(status().isNotFound());
+    }
+
+    @Test void syncSitemapCrawlFollowsTheSitemapOnly() throws Exception {
+        MvcResult r = mvc.perform(post("/v1/crawls").header("X-Tenant-Id", "t1").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"sitemapUrl\":\"" + S + "/nav.xml\",\"maxDepth\":1,\"maxPages\":10,\"mode\":\"SYNC\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.job.status").value("COMPLETED"))
+                .andExpect(jsonPath("$.job.request.sitemapUrl").value(S + "/nav.xml"))
+                .andExpect(jsonPath("$.job.request.sitemapGraph").doesNotExist())
+                .andExpect(jsonPath("$.job.request.seeds.length()").value(0))
+                .andExpect(jsonPath("$.job.stats.pages").value(2))     // / and /a; the HTML's /b is not followed
+                .andExpect(jsonPath("$.job.stats.assets").value(1))
+                .andReturn();
+        assertEquals(3, body(r).get("pages").size());
+    }
+
+    @Test void sitemapValidationErrorsAreProblems() throws Exception {
+        for (String bad : new String[]{
+                "{}",                                                                    // neither seeds nor a sitemap
+                "{\"sitemapUrl\":\"ftp://x.com/nav.xml\"}",                              // not http(s)
+                "{\"seeds\":[\"" + S + "/\"],\"sitemapUrl\":\"" + S + "/nav.xml\",\"sitemapGraph\":\"nav\"}",
+                "{\"seeds\":[\"" + S + "/\"],\"sitemapUrl\":\"" + S + "/nav.xml\",\"sitemapGraph\":\"shop_nav\"}",
+                "{\"sitemapGraph\":\"shop_nav\"}",                                      // a graph needs seeds
+                "{\"seeds\":[\"" + S + "/\"],\"sitemapGraph\":\"no_such_graph\"}",
+                "{\"sitemapUrl\":\"" + S + "/missing.xml\"}"}) {
+            mvc.perform(post("/v1/crawls").header("X-Tenant-Id", "t1").contentType(MediaType.APPLICATION_JSON)
+                    .content(bad)).andExpect(status().isBadRequest());
+        }
     }
 
     @Test void validationErrorsAreProblems() throws Exception {

@@ -4,6 +4,8 @@ import com.salesforce.einstein.webcrawler.engine.CrawlEngine;
 import com.salesforce.einstein.webcrawler.engine.EngineConfig;
 import com.salesforce.einstein.webcrawler.fetch.Fetcher;
 import com.salesforce.einstein.webcrawler.frontier.InMemoryFrontier;
+import com.salesforce.einstein.webcrawler.sitemap.InMemorySitemapGraphs;
+import com.salesforce.einstein.webcrawler.sitemap.SitemapGraphs;
 import com.salesforce.einstein.webcrawler.store.InMemoryContentStore;
 import com.salesforce.einstein.webcrawler.store.InMemoryJobStore;
 import com.salesforce.einstein.webcrawler.store.InMemoryPageStore;
@@ -21,10 +23,19 @@ public final class TestEngines {
     public static CrawlEngine engine(FakeWeb web, int workers) { return engine((Fetcher) web, workers); }
 
     public static CrawlEngine engine(Fetcher web, int workers) {
+        return engine(web, config(workers), new InMemorySitemapGraphs(4));
+    }
+
+    public static CrawlEngine engine(Fetcher web, EngineConfig cfg, SitemapGraphs sitemaps) {
         Clock clock = Clock.systemUTC();
-        EngineConfig cfg = EngineConfig.defaults().withWorkers(workers)
-                .withPoliteness(Duration.ZERO).withRetryBackoff(Duration.ofMillis(1));
         return new CrawlEngine(cfg, new InMemoryFrontier(clock), new InMemoryJobStore(), new InMemoryPageStore(),
-                new InMemoryContentStore(), web, new UrlNormalizer(new ParamRules()), TrapDetector.defaults(), clock);
+                new InMemoryContentStore(), web, new UrlNormalizer(new ParamRules()), TrapDetector.defaults(), sitemaps,
+                clock);
+    }
+
+    /** No politeness delay, 1 ms retry backoff. */
+    public static EngineConfig config(int workers) {
+        return EngineConfig.defaults().withWorkers(workers)
+                .withPoliteness(Duration.ZERO).withRetryBackoff(Duration.ofMillis(1));
     }
 }

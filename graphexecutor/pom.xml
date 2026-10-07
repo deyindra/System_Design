@@ -9,12 +9,127 @@
         <version>1.0-SNAPSHOT</version>
     </parent>
 
-    <artifactId>graphexecutor</artifactId>
+    <artifactId>graphexecutor-parent</artifactId>
+    <packaging>pom</packaging>
+
+    <!-- core: pure JDK (its only dependency is ds, also pure JDK, for the graphs), every executor (one VM, and
+         the cluster runtime's SPIs).
+         graphexecutor-age / graphexecutor-neo4j: a large graph kept in a graph database and processed by
+         workers on many VMs; each brings its own driver, so core stays free of third-party libraries.
+         graphexecutor-age-demo / graphexecutor-neo4j-demo: a demo worker image and compose cluster for each, and
+         the Docker ITs; kept out of the adapters' jars. -->
+    <modules>
+        <module>core</module>
+        <module>graphexecutor-age</module>
+        <module>graphexecutor-neo4j</module>
+        <module>graphexecutor-age-demo</module>
+        <module>graphexecutor-neo4j-demo</module>
+    </modules>
 
     <properties>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <postgresql.version>42.7.7</postgresql.version>
+        <!-- the version postgresql ${postgresql.version} brings in -->
+        <checker-qual.version>3.49.3</checker-qual.version>
+        <!-- 5.x is the last line that runs on Java 17 -->
+        <neo4j-driver.version>5.28.15</neo4j-driver.version>
+        <testcontainers.version>1.21.4</testcontainers.version>
+        <awaitility.version>4.2.2</awaitility.version>
+        <maven-failsafe-plugin.version>3.5.2</maven-failsafe-plugin.version>
     </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>${testcontainers.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.salesforce.einstein.ds</groupId>
+                <artifactId>ds</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.salesforce.einstein</groupId>
+                <artifactId>core</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.salesforce.einstein</groupId>
+                <artifactId>graphexecutor-age</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.salesforce.einstein</groupId>
+                <artifactId>graphexecutor-neo4j</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.postgresql</groupId>
+                <artifactId>postgresql</artifactId>
+                <version>${postgresql.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.awaitility</groupId>
+                <artifactId>awaitility</artifactId>
+                <version>${awaitility.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.checkerframework</groupId>
+                <artifactId>checker-qual</artifactId>
+                <version>${checker-qual.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.neo4j.driver</groupId>
+                <artifactId>neo4j-java-driver</artifactId>
+                <version>${neo4j-driver.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <!-- *IT tests start containers from the packaged module, so they run after package -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-failsafe-plugin</artifactId>
+                    <version>${maven-failsafe-plugin.version}</version>
+                    <executions>
+                        <execution>
+                            <goals>
+                                <goal>integration-test</goal>
+                                <goal>verify</goal>
+                            </goals>
+                        </execution>
+                    </executions>
+                </plugin>
+                <!-- a worker image's classpath (the demo modules): target/*.jar plus target/lib -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-dependency-plugin</artifactId>
+                    <version>3.8.1</version>
+                    <executions>
+                        <execution>
+                            <id>worker-classpath</id>
+                            <phase>package</phase>
+                            <goals>
+                                <goal>copy-dependencies</goal>
+                            </goals>
+                            <configuration>
+                                <includeScope>runtime</includeScope>
+                                <outputDirectory>${project.build.directory}/lib</outputDirectory>
+                            </configuration>
+                        </execution>
+                    </executions>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
 
 </project>

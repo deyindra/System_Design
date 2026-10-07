@@ -1,77 +1,37 @@
-# graphexecutor: generic graphs, cycle-safe BFS/DFS, a group-parallel TaskExecutor, and its distributed form
+# graphexecutor: group-parallel TaskExecutors over `ds` graphs, and their distributed forms
 
-Pure JDK (no third-party libraries; JUnit is test-scope only).
+Five modules under the `graphexecutor-parent` POM:
+
+| Module | artifactId | What | Dependencies |
+|---|---|---|---|
+| `core` | `core` | sections 1 to 4: executors (one VM) and the cluster runtime's SPIs | `ds` (pure JDK); JUnit is test-scope only |
+| [`graphexecutor-age`](graphexecutor-age/README.md) | `graphexecutor-age` | a graph in Apache AGE (PostgreSQL), processed by workers on many VMs | PostgreSQL JDBC driver |
+| [`graphexecutor-neo4j`](graphexecutor-neo4j/README.md) | `graphexecutor-neo4j` | the same over Neo4j | Neo4j Java driver |
+| [`graphexecutor-age-demo`](graphexecutor-age-demo/README.md) | `graphexecutor-age-demo` | a demo worker image and compose cluster over AGE, and the AGE ITs | `graphexecutor-age` |
+| [`graphexecutor-neo4j-demo`](graphexecutor-neo4j-demo/README.md) | `graphexecutor-neo4j-demo` | the same over Neo4j | `graphexecutor-neo4j` |
+
+The graphs the executors run over (`Graph`, cycle-safe BFS/DFS) are in the [`ds`](../ds/Graph.md) module,
+package `ds.graph`.
 
 | Section | Package | Main types |
 |---|---|---|
-| [1. Graph](#1-graph) | `graph` | `Graph`, `AdjacencyGraph` |
-| [2. BFS / DFS](#2-bfs--dfs-iterators-cycle-safe) | `graph` | `BfsIterator`, `DfsIterator` |
-| [3. TaskExecutor](#3-taskexecutor) | `executor` | `TaskExecutor`, `TopologicalTaskExecutor` |
-| [4. Scaling out](#4-scaling-out-distributed-package) | `distributed` | `DistributedTopologicalExecutor`, `CompletionLog` |
+| [1. TaskExecutor](#1-taskexecutor) | `executor` | `TaskExecutor`, `TopologicalTaskExecutor` |
+| [2. Scaling out](#2-scaling-out-distributed-package) | `distributed`, `spi` | `DistributedTopologicalExecutor`, `CompletionLog` |
+| [3. Traversal executors](#3-traversal-executors-reachability-not-dependency) | `executor`, `distributed` | `TraversalTaskExecutor`, `DistributedTraversalExecutor` |
+| [4. Across machines](#4-across-machines-a-graph-in-a-database-workers-on-many-vms) | `spi`, `distributed` | `GraphStore`, `ClusterStore`, `Worker` |
 
-**Build and test** (JDK 17+; 65 tests: 21 graph, 11 traversal, 19 executor, 14 distributed):
+**Build and test** (JDK 17+). `core` has 63 tests: 19 executor, 12 traversal executor, 14 distributed
+topological, 10 distributed traversal and 8 worker; the 32 graph and BFS/DFS tests are in `ds`. `graphexecutor-age` has 4 unit
+tests and `graphexecutor-neo4j` 13. The
+`*IT`s are in the demo modules, because they run the demo's workers: 7 in each. They need Docker and are
+skipped without it.
 
 ```bash
 cd graphexecutor
-mvn test
+mvn install          # unit tests, then the ITs (failsafe, after package: they build the worker image)
 ```
 
-## 1. Graph
-
-Direction and weighting are two independent **properties of a graph instance**, not separate classes:
-
-```java
-Graph<String> g = Graph.directed();            // unweighted, unidirectional
-Graph<String> g = Graph.undirected();          // unweighted, bidirectional
-Graph<String> g = Graph.weightedDirected();    // weighted,   unidirectional
-Graph<String> g = Graph.weightedUndirected();  // weighted,   bidirectional
-g.isDirected(); g.isWeighted();
-```
-
-`Graph<T>` is the interface; `AdjacencyGraph<T>` (package-private) is the single implementation
-behind all four factories. One class configured by two flags avoids a class per combination
-(2 × 2 = 4 today, 8 with a third property).
-
-| Operation | Semantics | Cost |
-|---|---|---|
-| `addNode(n)` | false if present | O(1) |
-| `removeNode(n)` | also removes every incident edge | O(degree) |
-| `updateNode(old, new)` | renames, moving every edge and weight; throws if `new` exists | O(degree) |
-| `addEdge(a, b)` | **unweighted only**; adds missing endpoints; false if edge exists | O(1) |
-| `addEdge(a, b, w)` | **weighted only**; false (weight kept) if edge exists | O(1) |
-| `updateEdge(a, b, w)` | **weighted only**; false if no such edge | O(1) |
-| `removeEdge(a, b)` | false if no such edge | O(1) |
-| `edgeWeight(a, b)` | `Optional<Double>`: empty if unweighted or no such edge | O(1) |
-| `successors` / `predecessors`, `outDegree` / `inDegree` | undirected: both are the neighbors / degree | O(1) |
-| `subgraph(nodes)` | independent copy with the same properties and weights | O(V + E) |
-
-Calling the other kind's edge method throws `UnsupportedOperationException`. So a weighted graph
-*must* have a weight on every edge, and an unweighted graph never has one.
-
-**Storage:** `Map<T, Map<T, Optional<Double>>>`. Weighted edges hold `Optional.of(w)`; unweighted
-edges hold `Optional.empty()`, a shared singleton, so unweighted graphs pay nothing for it.
-
-**The direction trick.** Each edge `a -> b` is written as `out[a][b]` and `in[b][a]`. Directed: `in`
-is a separate reverse index (that's what makes `removeNode` O(degree)). Undirected: `in` *is* `out`,
-so writing `in[b][a]` is exactly the mirror entry. Every method is written once and is correct for both.
-
-`LinkedHashMap` everywhere, so traversal order is deterministic (insertion order).
-
-## 2. BFS / DFS iterators (cycle-safe)
-
-`TraversalIterator<T>` (template) → `BfsIterator<T>`, `DfsIterator<T>`.
-
-- **Cycles:** a `visited` set; each node is returned once. O(V + E) time, O(V) space.
-- **BFS** marks visited on *enqueue*, so a node never sits in the queue twice.
-- **DFS** is iterative (no stack overflow on a 200k-node chain) and keeps a stack of *neighbor
-  iterators*, giving the exact recursive preorder with stack depth = path length. The "push all
-  neighbors" shortcut gets the sibling order backwards and can push one node many times.
-- **Lazy** (`hasNext` computes one step), **fail-fast** (CME if the graph changes), and multi-root:
-  `bfs()`/`dfs()` start a new tree at each unreached node, so they cover disconnected graphs.
-- They take a `node -> neighbors` function, so they also work on *views* of a graph. The executor
-  uses this to walk a directed graph's edges in both directions.
-
-## 3. TaskExecutor
+## 1. TaskExecutor
 
 ```mermaid
 flowchart LR
@@ -157,7 +117,7 @@ Isn't parallel Kahn's a bad idea? Only when the decrement *is* the work, as in s
 cores. Here each decrement follows a task that is orders of magnitude slower, so contention on the
 counters is negligible.
 
-## 4. Scaling out: `distributed` package
+## 2. Scaling out: `distributed` package
 
 `DistributedTopologicalExecutor<T>` is Kahn's algorithm the way it scales past one machine:
 bulk-synchronous rounds over partitions (the model Google's Pregel popularized). It is simulated in one JVM, with a partition as a unit of work on
@@ -268,3 +228,197 @@ splitting the counter of a node with a huge in-degree.
 
 **Further extensions:** cancellation and timeouts per group; incremental regrouping with union-find when
 edges are only added.
+
+## 3. Traversal executors: reachability, not dependency
+
+The topological executors read an edge as a dependency. The edge points from the prerequisite to
+the dependant:
+
+| Statement | Edge | Who waits |
+|---|---|---|
+| A depends on B | `addEdge(B, A)` | A waits for B |
+| compile before test | `addEdge(compile, test)` | test waits for compile |
+
+Some workloads have edges that only mean "reachable from". Crawling a site's navigation is one:
+`home -> about` means about is linked from home, not that about waits for home, and `about -> home`
+is just as normal. For those, `TraversalTaskExecutor` and `DistributedTraversalExecutor` sit next to
+the topological pair. Nothing about the topological pair changes.
+
+| | Topological (`TopologicalTaskExecutor`, `DistributedTopologicalExecutor`) | Traversal (`TraversalTaskExecutor`, `DistributedTraversalExecutor`) |
+|---|---|---|
+| Edge B→A means | A depends on B, so A waits | A is reachable from B; nobody waits |
+| Cycle | the group is ineligible | fine: each node runs once |
+| When a node runs | after its longest dependency chain (Kahn's waves) | at its shortest distance from a root (BFS level) |
+| A task fails | its dependants are skipped | nothing is blocked |
+| Distributed message | decrement `(v, -k)`: not idempotent, dedupe is required | visit `{v}`: idempotent, dedupe only saves work |
+| Rounds | longest chain + 1 | deepest shortest path + 1 (+ mark-only rounds past `maxDepth`) |
+
+```java
+new TraversalTaskExecutor<String>(groupPool, taskPool, IneligibleGroupPolicy.ISOLATE_GROUP) {
+    @Override protected void executeTask(String node, int depth) { ... }
+    @Override protected Object laneOf(String node) { return host(node); }      // one at a time per lane
+    @Override protected Duration laneDelay() { return Duration.ofSeconds(1); } // gap within a lane
+};
+```
+
+**Hooks** (the same on both):
+
+| Hook | Default | Meaning |
+|---|---|---|
+| `executeTask(T, int depth)` | abstract | the work; whatever it throws fails only that node |
+| `roots(Graph)` | nodes with no predecessors | where BFS starts |
+| `startRootlessGroups()` | true | a group with no admitted root starts at its first admitted node (a cycle nothing points into still runs). False: the group is reported unreachable |
+| `admit(T)` | all | a rejected node is neither run nor traversed through (`excluded`) |
+| `maxDepth()` | unlimited | deeper nodes are reached but not run (`tooDeep`) |
+| `laneOf(T)` | the node | nodes of one lane run one at a time |
+| `laneDelay()` | 0 | the minimum gap between the starts of two tasks in a lane |
+
+The result lists `completed`, `depth`, `failed`, `excluded`, `tooDeep` and `unreachable` (admitted,
+but no root reaches it).
+
+**Local** (`TraversalTaskExecutor`, a `TaskExecutor`, so it uses the same groups, policy and per-group
+isolation): BFS through the admitted nodes gives each one its depth. Each lane then runs as a chain on
+`taskPool`, with `CompletableFuture.delayedExecutor` for the gap, so no thread sleeps between tasks.
+Lanes run concurrently; a failing task is recorded and its lane continues. The sequential constructor
+runs the lanes one after another, in BFS order.
+
+**Distributed** (`DistributedTraversalExecutor`): BFS in bulk-synchronous rounds, where round r runs
+depth r. It keeps every feature of §2 that doesn't depend on reading edges as dependencies:
+
+- the snapshot, `Partitioner` (plus `byKey`), `LabelPropagation` and `GroupPlacement`;
+- combined messages: one `VisitBatch` per (sender, receiver, round);
+- the `CompletionLog` as the only durable state, with log-before-send, round-consistent reads and
+  first-outcome-wins;
+- crash, rebuild and replay up to 3 attempts, where only the crashed partition recovers;
+- dedupe by batch id;
+- the `newCompletionLog`, `deliveriesPerSend` and `afterSend` hooks.
+
+The frontier needs no checkpoint, for the same reason the counters didn't:
+
+```
+frontier(r) = { v owned, admitted, no outcome before r : r = 0 and v is a root,
+                                                         or some predecessor has an outcome at r-1 }
+```
+
+Every visited node expands, including failed and too-deep ones (logged `SKIPPED`), so this rule
+gives exactly what the inbox would have. BFS reaches a node first at its shortest depth, so the
+first logged outcome is also the right one.
+
+The extra hook is `placeGroupsWhole()` (default true). Set it false, with `Partitioner.byKey(lane)`,
+and every node of a lane lives on one partition. Then "one task per lane at a time" holds across the
+whole run with no coordination: that is how a crawler stays polite to each host.
+
+Not applicable here: the cycle dry run, `IneligibleGroupPolicy` rejections and the over-decrement
+guard. Nothing is ineligible and there are no counters.
+
+## 4. Across machines: a graph in a database, workers on many VMs
+
+Sections 2 and 3 simulate partitions in one JVM: the snapshot, the owner map and the transport are all
+in memory. To process a graph larger than one VM, keep the graph in a database and run one `Worker` per
+VM. Each worker streams only its own shards from the database, and the run's shared state goes through
+the same database. The workers never talk to each other.
+
+| Which executor | Graph | Where it runs |
+|---|---|---|
+| `TopologicalTaskExecutor`, `TraversalTaskExecutor` | `Graph<T>` in memory | one VM, threads |
+| `DistributedTopologicalExecutor`, `DistributedTraversalExecutor` | `Graph<T>` in memory | one VM, simulated partitions |
+| `Worker.topological(...)`, `Worker.traversal(...)` over `GraphStore<T>` | AGE or Neo4j | many VMs (or `InMemoryClusterStore` threads, in tests) |
+
+The same executor subclass runs everywhere, with the same hooks and meaning. Only the SPIs are implemented
+per store. They are in `core`'s `spi` package (pure JDK, interfaces only); `spi.memory` is the in-memory
+backend, and the adapter modules are the database ones:
+
+| SPI (`spi`) | Role | `spi.memory` | `graphexecutor-age` | `graphexecutor-neo4j` |
+|---|---|---|---|---|
+| `GraphStore<T>` | read-only, sharded, batched view: `nodes(shard, after, limit)` (keyset paging), `sources`, `successors(batch)`, `predecessors(batch)`, `inDegree(batch)` | `InMemoryGraphStore` | `AgeGraphStore` (Cypher via `cypher()`) | `Neo4jGraphStore` (`UNWIND $keys`) |
+| `NodeCodec<T>` | a node to a string key and back | `NodeCodec.strings()`, `NodeCodec.of(…)` | the same | the same |
+| `CompletionLog<T>` | outcomes, first one wins | `InMemoryCompletionLog` | `PostgresCompletionLog` (`ON CONFLICT DO NOTHING`) | `Neo4jCompletionLog` (`MERGE … ON CREATE SET`) |
+| `ClusterStore` | run state, leases, messages, arrivals | `InMemoryClusterStore` | `PostgresClusterStore` (tables, `FOR UPDATE`) | `Neo4jClusterStore` (nodes, lock-then-check) |
+| loader | writes a graph sharded the way the store reads it | (`InMemoryGraphStore.of` copies a `Graph`) | `AgeGraphLoader` | `Neo4jGraphLoader` |
+
+`InMemoryGraphStore.of(graph, shards, shardOf)` is the in-memory store. It is used by the tests, and for
+comparing a cluster run against the one-VM executors.
+
+### The protocol
+
+Rounds are bulk-synchronous, as in §2 and §3. Round r of a traversal runs depth r; round r of a
+topological run runs the nodes whose last dependency ran in round r-1. Nothing is kept between rounds:
+a shard round's input is the previous round's messages (in the `ClusterStore`) plus the outcomes in the
+`CompletionLog`. So a shard can move to another worker at any round boundary, with no state handed over.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W1 as Worker 1
+    participant DB as AGE / Neo4j
+    participant W2 as Worker 2
+    W1->>DB: createRun (idempotent), claim shards 0-1
+    W2->>DB: createRun, claim shards 2-3
+    loop heartbeat, every leaseTtl/3
+        W1->>DB: renew my leases (store time)
+        W2->>DB: renew my leases
+    end
+    Note over W1,W2: round r
+    W1->>DB: beginAttempt(r, shard), read inbox(r) and frontier batches
+    W1->>W1: executeTask(...) for the frontier
+    W1->>DB: log outcomes, then send batches to (r+1, to)
+    W1->>DB: arrive(r, shard) (fenced by the lease)
+    W2->>DB: same for shards 2-3, then arrive
+    W1->>DB: advance(r) (compare-and-set: all shards arrived?)
+    Note over DB: round r+1, or DONE when round r sent nothing
+    Note over W2: W2 dies (SIGKILL): its leases are not renewed
+    W1->>DB: leases expire (store clock), claim shards 2-3
+    W1->>DB: beginAttempt(r+1, 2) returns 1: replay
+    W1->>DB: logged nodes are not run again, duplicate sends are no-ops
+    Note over W1,DB: a shard round started 3 times fails the run
+```
+
+The rules, each enforced by the store:
+
+- **Store time.** Lease expiry is compared against `now()` / `datetime()`, never a worker's clock. So clock
+  skew cannot give one shard two owners.
+- **Fenced arrivals.** `arrive` succeeds only for the worker that holds the shard's unexpired lease. A
+  worker that was presumed dead (paused for GC, say) cannot finish a round its replacement now owns.
+- **Idempotent writes.** A message is keyed by (run, round, from, to) and an arrival by (run, round,
+  shard), so a replay's re-sends change nothing. The log keeps the first outcome per node.
+- **No coordinator.** Any worker calls `advance` after its shards arrive. It is a compare-and-set on the
+  round, so only the first call that finds every shard arrived moves the run on. There is no
+  coordinator lease to lose.
+- **Log before send.** This is §2's recovery rule. A replayed shard rebuilds from the log and does not
+  rerun what was logged. `executeTask` must still be idempotent, because a task can run and then crash
+  before its outcome is logged.
+- **Attempts.** `beginAttempt` counts the starts of each (round, shard). The 3rd replay fails the run
+  (`MAX_ATTEMPTS`), as a partition that keeps crashing does in one JVM.
+- **Claiming.** A worker takes free shards up to `maxShards`. It takes more only when a shard has stayed
+  free for a whole lease. So a dead worker's shards spread over the survivors.
+
+Hooks run on every worker. They must be **deterministic**, giving the same answer on every machine, and
+thread-safe: `admit`, `laneOf`, `maxDepth` and `roots`. Shards replace `GroupPlacement` here, so a hook
+such as `laneOf` is honoured across machines only when it agrees with the shard function. That is why
+the crawler shards by host (`GraphStore.byKey(host, shards)`).
+
+### Running it
+
+The adapter modules are libraries: no `main`, no image. A worker image comes from a module that depends on an
+adapter and has its own `main`: its `src/main/docker/Dockerfile` copies the module's jar and `target/lib` (from
+`copy-dependencies`, so the adapter and its driver), and runs that `main`. The `main` opens an
+`AgeWorkerContext` or `Neo4jWorkerContext`, which reads the environment (database, `GRAPH`, `SHARDS`, `RUN_ID`,
+`WORKER_ID`, `SHARDS_PER_WORKER`, `LEASE_TTL`, `POLL_INTERVAL`, `BATCH_SIZE`), builds its `Worker` from the
+context's stores, and runs it. The demo modules are such modules: `DemoWorkerMain` runs the factory that
+`WORKER_FACTORY` names, a random-graph traversal or dependency-ordered run that records every task. To run
+your own executor, copy a demo module's POM and Dockerfile. (The web crawler uses only the stores: its
+`adapter-graph-*` modules read sitemap graphs through `AgeGraphStore` and `Neo4jGraphStore`.)
+
+```bash
+mvn -q -pl graphexecutor/graphexecutor-age-demo -am package -DskipTests        # from System_Design
+docker compose -f graphexecutor/graphexecutor-age-demo/docker/compose.yml up --scale worker=3
+docker kill <one worker>        # the others take its shards over; the run still finishes
+```
+
+The demo modules' ITs do the same with Testcontainers. Each one starts the database and three worker containers, loads
+a random graph, and SIGKILLs one worker while it is inside a task. It then checks four things:
+
+- the run finishes;
+- every node has the round a single process computes for it;
+- `recoveries >= 1`;
+- no node logged before the kill ran again.

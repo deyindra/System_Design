@@ -11,6 +11,9 @@ import com.salesforce.einstein.webcrawler.fetch.HttpFetcher;
 import com.salesforce.einstein.webcrawler.frontier.Frontier;
 import com.salesforce.einstein.webcrawler.frontier.InMemoryFrontier;
 import com.salesforce.einstein.webcrawler.render.CrawlResults;
+import com.salesforce.einstein.webcrawler.sitemap.InMemorySitemapGraphs;
+import com.salesforce.einstein.webcrawler.sitemap.SitemapGraphService;
+import com.salesforce.einstein.webcrawler.sitemap.SitemapGraphs;
 import com.salesforce.einstein.webcrawler.store.ContentStore;
 import com.salesforce.einstein.webcrawler.store.FileSystemContentStore;
 import com.salesforce.einstein.webcrawler.store.InMemoryContentStore;
@@ -31,7 +34,7 @@ import java.time.Clock;
 
 /**
  * Wires the plain-Java engine to its ports ({@link Frontier}, {@link JobStore}, {@link PageStore}, {@link ContentStore},
- * {@link Fetcher}). The engine depends only on those interfaces, never on a vendor SDK.
+ * {@link SitemapGraphs}, {@link Fetcher}). The engine depends only on those interfaces, never on a vendor SDK.
  *
  * <p>Each built-in adapter is selected by {@code crawler.adapters.*} and backs off if another bean is present. A
  * provider module (one per cloud, or self-hosted) ships its own auto-configuration that registers beans for its
@@ -72,6 +75,16 @@ public class CrawlerConfiguration {
         return new FileSystemContentStore(p.adapters().contentRoot());
     }
 
+    @Bean(destroyMethod = "close") @ConditionalOnMissingBean
+    @ConditionalOnProperty(prefix = ADAPTERS, name = "sitemap-graph", havingValue = "memory", matchIfMissing = true)
+    SitemapGraphs sitemapGraphs(CrawlerProperties p) { return new InMemorySitemapGraphs(p.sitemap().shards()); }
+
+    @Bean(destroyMethod = "close")
+    SitemapGraphService sitemapGraphService(CrawlerProperties p, SitemapGraphs sitemaps, Fetcher fetcher,
+                                            UrlNormalizer normalizer, Clock clock) {
+        return new SitemapGraphService(sitemaps, fetcher, normalizer, p.maxSitemapBytes(), p.sitemap().loadThreads(), clock);
+    }
+
     @Bean @ConditionalOnMissingBean EgressPolicy egressPolicy(CrawlerProperties p, Clock clock) {
         return new EgressPolicy(CachingDnsResolver.system(clock), p.egress().allowPrivate(), p.egress().ports());
     }
@@ -83,11 +96,12 @@ public class CrawlerConfiguration {
 
     @Bean(destroyMethod = "close")
     CrawlEngine crawlEngine(CrawlerProperties p, Frontier frontier, JobStore jobs, PageStore pages, ContentStore contents,
-                            Fetcher fetcher, UrlNormalizer normalizer, TrapDetector traps, Clock clock, ObjectMapper json,
-                            EgressPolicy egress) {
+                            Fetcher fetcher, UrlNormalizer normalizer, TrapDetector traps, SitemapGraphs sitemaps,
+                            Clock clock, ObjectMapper json, EgressPolicy egress) {
         EngineConfig cfg = new EngineConfig(p.workers(), p.politenessDelay(), p.maxRetries(), p.retryBackoff(),
-                p.maxRedirects(), p.maxPageBytes(), p.agentToken());
-        CrawlEngine engine = new CrawlEngine(cfg, frontier, jobs, pages, contents, fetcher, normalizer, traps, clock);
+                p.maxRedirects(), p.maxPageBytes(), p.agentToken(), p.maxPagesPerJob(), p.maxSitemapBytes());
+        CrawlEngine engine = new CrawlEngine(cfg, frontier, jobs, pages, contents, fetcher, normalizer, traps, sitemaps,
+                clock);
         engine.onFinished(new WebhookNotifier(json, jobs, egress));
         return engine;
     }

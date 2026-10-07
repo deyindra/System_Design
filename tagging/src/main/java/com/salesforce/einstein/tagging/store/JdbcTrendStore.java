@@ -71,8 +71,9 @@ public final class JdbcTrendStore implements TrendStore, AutoCloseable {
                 .addValue("now", clock.instant().atOffset(ZoneOffset.UTC));
         jdbc.update("INSERT INTO trend_progress (tenant_id, source_shard, last_seq, updated_at) "
                 + "VALUES (:t, :s, 0, :now) ON CONFLICT DO NOTHING", key);
-        long last = jdbc.queryForObject("SELECT last_seq FROM trend_progress WHERE tenant_id = :t AND source_shard = :s "
-                + "FOR UPDATE", key, Long.class);
+        // the row exists (inserted above), and last_seq is NOT NULL
+        long last = Objects.requireNonNull(jdbc.queryForObject("SELECT last_seq FROM trend_progress "
+                + "WHERE tenant_id = :t AND source_shard = :s FOR UPDATE", key, Long.class), "last_seq");
 
         TreeMap<Cell, Long> deltas = new TreeMap<>(Comparator.comparingInt(Cell::grain)
                 .thenComparingLong(Cell::bucket).thenComparingLong(Cell::tagId));
@@ -97,7 +98,7 @@ public final class JdbcTrendStore implements TrendStore, AutoCloseable {
         if (high == last) {
             return;
         }
-        // A deleted tag can't be attached afterwards, so all of its pending deltas precede the delete.
+        // A deleted tag can't be attached afterward, so all of its pending deltas precede its deletion.
         deltas.keySet().removeIf(c -> deleted.contains(c.tagId()));
         upsert(tenant, deltas);
         for (long tagId : deleted) {
