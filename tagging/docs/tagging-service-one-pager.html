@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Designing a Tagging Service: Interview Walkthrough</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 16px; line-height: 1.55;
+         color: #222; max-width: 1180px; margin: 28px auto; padding: 0 22px; }
+  h1 { font-size: 2em; margin: 0 0 4px; }
+  h2 { font-size: 1.3em; margin: 30px 0 8px; padding-bottom: 4px; border-bottom: 2px solid #3b6fd1; color: #1d3f86; }
+  h3 { font-size: 1.05em; margin: 16px 0 6px; }
+  p, ul, ol { margin: 6px 0 10px; }
+  ul, ol { padding-left: 22px; }
+  li { margin: 3px 0; }
+  .sub { color: #666; margin: 0 0 14px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 28px; }
+  table { border-collapse: collapse; width: 100%; font-size: .93em; margin: 8px 0 12px; }
+  th, td { border: 1px solid #ddd; padding: 6px 9px; text-align: left; vertical-align: top; }
+  th { background: #f1f5fb; }
+  code { font-family: Menlo, Consolas, monospace; font-size: .86em; background: #f3f3f3; padding: 0 3px; border-radius: 3px; }
+  pre { background: #1e1e1e; color: #e6e6e6; padding: 12px 14px; border-radius: 6px; overflow-x: auto; font-size: .84em; line-height: 1.45; }
+  pre code { background: none; color: inherit; padding: 0; }
+  .mermaid { background: #fafafa; border: 1px solid #e5e5e5; border-radius: 6px; padding: 10px; margin: 10px 0; text-align: center;
+             font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; line-height: 1.2; overflow-x: auto; }
+  .mermaid svg { max-width: 100% !important; height: auto; }
+  .mermaid foreignObject { overflow: visible; }
+  .mermaid .nodeLabel, .mermaid .edgeLabel, .mermaid .cluster-label { white-space: nowrap; }
+  .box { background: #f6f9ff; border-left: 4px solid #3b6fd1; padding: 10px 14px; margin: 10px 0; }
+  .say { background: #f3fbf5; border-left: 4px solid #2f9e57; padding: 8px 14px; margin: 10px 0; }
+  .say::before { content: "Say it like this: "; font-weight: 700; color: #1f6e3d; }
+  .note { color: #555; font-size: .92em; }
+  dl.gloss { display: grid; grid-template-columns: 170px 1fr; gap: 4px 14px; margin: 6px 0; }
+  dl.gloss dt { font-weight: 700; }
+  dl.gloss dd { margin: 0; }
+  table.bits td, table.bits th { text-align: center; font-family: Menlo, Consolas, monospace; font-size: .95em; padding: 4px 8px; }
+  table.bits td:first-child, table.bits th:first-child { text-align: left; font-family: inherit; }
+  table.bits td.op { text-align: left; font-family: inherit; color: #555; }
+  .one { background: #dff3e4; font-weight: 700; }
+  .hit { background: #2f9e57; color: #fff; font-weight: 700; }
+  tr.res td { border-top: 2px solid #888; }
+</style>
+<script src="mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "neutral",
+    themeVariables: { fontSize: "16px", fontFamily: '-apple-system, "Segoe UI", Helvetica, Arial, sans-serif' },
+    flowchart: { useMaxWidth: false, nodeSpacing: 35, rankSpacing: 50, padding: 16, wrappingWidth: 400 },
+    sequence: { useMaxWidth: false, actorMargin: 50, messageMargin: 34, boxMargin: 8, width: 170,
+                actorFontSize: 16, messageFontSize: 16, noteFontSize: 15,
+                actorFontFamily: '-apple-system, Helvetica, Arial, sans-serif',
+                messageFontFamily: '-apple-system, Helvetica, Arial, sans-serif',
+                noteFontFamily: '-apple-system, Helvetica, Arial, sans-serif' },
+    er: { useMaxWidth: false, entityPadding: 14, minEntityWidth: 150, fontSize: 15 }
+  });
+</script>
+</head>
+<body>
+
+<h1>Designing a Tagging Service</h1>
+<p class="sub">An interview walkthrough: what the service does, how big it must be, which technology does what, how a
+request flows, how the data is stored, and how tag search works (inverted index, RoaringBitmaps, boolean operations).
+Based on <code>tagging/README.md</code>, <code>tagging/INTERVIEW.md</code> and the code, compared with
+<a href="https://medium.com/@sonalisahu2309/design-tagging-service-01e7274e741a">"Design Tagging Service"</a> on Medium.</p>
+
+<!-- =============================================================== -->
+<h2>1. Executive overview</h2>
+
+<p><b>The problem.</b> Jira, Confluence and Bitbucket all let users put labels such as <code>bug</code>, <code>p1</code>
+or <code>release-7</code> on their items: issues, pages and pull requests. Instead of each product building its own,
+we build <b>one shared tagging service</b>. Products call it to <b>create tags</b>, <b>attach tags to items</b>,
+<b>show the tags on an item</b>, and <b>find items by their tags</b>.</p>
+
+<p><b>What makes it hard.</b></p>
+<ul>
+  <li><b>Scale:</b> 300,000 customer companies (<i>tenants</i>), 4 billion tagged items, 20 billion tag-to-item
+    links, and up to 300,000 reads and 30,000 writes per second.</li>
+  <li><b>Correctness:</b> if a user adds <code>bug</code> to an issue and refreshes, the tag must be there, every time,
+    on every server. We can't serve stale data from a cache.</li>
+  <li><b>Fairness:</b> a handful of huge customers (<i>whales</i>, with 50M+ items each) must not slow down everyone else.</li>
+  <li><b>Portability:</b> it has to run on AWS, GCP or on-prem, so no cloud-only databases.</li>
+</ul>
+
+<p><b>The design in three plain sentences.</b></p>
+<table>
+  <tr><th>#</th><th>Decision</th><th>What it buys us</th></tr>
+  <tr><td>1</td><td><b>Split the data by customer.</b> Each customer's tags live entirely in one of 16 PostgreSQL databases
+      (<i>shards</i>). The biggest customers get a shard of their own.</td>
+      <td>Every request touches exactly one database, so every change is a simple, safe database transaction.</td></tr>
+  <tr><td>2</td><td><b>Always read from the main copy of the database</b> (the <i>primary</i>), and don't confirm a write
+      until a backup copy in another data centre has it.</td>
+      <td>Users always see their latest change, and a confirmed change survives losing a data centre. Splitting
+      the data 16 ways makes this affordable: each primary runs at about 25% load.</td></tr>
+  <tr><td>3</td><td><b>Keep a "tag → items" list for every tag</b> (an <i>inverted index</i>), stored compactly in each
+      server's memory, so that "issues tagged <code>bug</code> and <code>p1</code> but not <code>done</code>" becomes
+      a simple boolean AND / NOT of three lists.</td>
+      <td>A query that would take seconds in plain SQL takes about 1 millisecond. Before using the in-memory copy, we
+      check it has every confirmed change, so it is never stale (§6).</td></tr>
+</table>
+
+<div class="say">"I split the data by customer so every request is one transaction on one database. Every read goes to
+the primary, so users always see their own writes, and splitting 16 ways keeps each primary at a quarter of its
+capacity. The one query SQL is slow at is combining tags, so I keep, per tag, the set of item numbers that carry it.
+Then 'bug AND p1 AND NOT done' is just AND and NOT on three sets, which is about a millisecond in memory. I only use
+that copy when I can prove it's up to date."</div>
+
+<h3>Terms used on this page</h3>
+<dl class="gloss">
+  <dt>Tenant</dt><dd>One customer company. All its data is kept together and never mixed with another's.</dd>
+  <dt>Entity / item</dt><dd>The thing being tagged: a Jira issue, a Confluence page, a pull request. We store only a
+    reference such as <code>jira:issue/10042</code>, never the item itself.</dd>
+  <dt>Assignment</dt><dd>One link "item X has tag T". There are 20 billion of them.</dd>
+  <dt>Shard</dt><dd>One of 16 independent PostgreSQL databases. Each one holds a subset of the tenants.</dd>
+  <dt>Primary / standby</dt><dd>The primary is the copy of a shard that accepts reads and writes. Standbys are live
+    copies in other data centres, ready to take over.</dd>
+  <dt>Strong consistency</dt><dd>Once a write is confirmed, every later read, from any server, sees it.</dd>
+  <dt>Forward index</dt><dd>Item → its tags ("what tags does JIRA-42 have?").</dd>
+  <dt>Inverted index</dt><dd>Tag → its items ("which issues have <code>bug</code>?"). It's the same idea as the index
+    at the back of a book (word → pages), or a search engine's word → documents list.</dd>
+  <dt>Posting list</dt><dd>One entry of an inverted index: the list of items for one tag.</dd>
+  <dt>entity_seq</dt><dd>A small number (1, 2, 3, …) given to each item when it is first tagged, so that a posting
+    list can be a set of numbers instead of long strings.</dd>
+  <dt>Bitmap</dt><dd>A row of 0/1 bits, one per item number: bit <i>n</i> is 1 if item <i>n</i> has the tag.</dd>
+  <dt>RoaringBitmap</dt><dd>An open-source library for <b>compressed</b> bitmaps. It stores a set of numbers in very
+    little memory and still does AND / OR / NOT on millions of numbers in about a millisecond.</dd>
+  <dt>Outbox</dt><dd>A table where every change also writes an event row, in the same transaction. A relay then
+    publishes those rows to Kafka, so no event is ever lost or invented.</dd>
+  <dt>seq</dt><dd>A number given to each change in a shard, in order (the outbox row's id). It only goes up, like a
+    page number in the shard's history.</dd>
+  <dt>Watermark / read barrier</dt><dd>The watermark is the last change <code>seq</code> an in-memory copy has applied.
+    The barrier is the tenant's latest change <code>seq</code> in the database. If watermark ≥ barrier, the copy is
+    up to date.</dd>
+</dl>
+
+<!-- =============================================================== -->
+<h2>2. Requirements and scale</h2>
+<div class="grid2">
+<div>
+<h3>What it must do (functional)</h3>
+<ul>
+  <li><b>Manage tags:</b> create, rename, change colour, delete. A name is unique within a tenant, ignoring case
+    and spaces (<code>Bug</code>, <code>bug </code> and <code>BUG</code> are one tag).</li>
+  <li><b>Tag items:</b> attach tags (by id, or by name, creating the tag if needed), remove tags, replace an item's
+    whole set, and bulk-tag up to 500 items × 50 tags in one call.</li>
+  <li><b>Read:</b> the tags of an item (<b>by far the most common call</b>: it runs on every issue or page view),
+    the items with a tag (paged), and tag-name autocomplete.</li>
+  <li><b>Search:</b> combine tags, e.g. <i>all of</i> <code>bug</code>, <code>p1</code> and <i>none of</i>
+    <code>done</code>, optionally only Jira issues.</li>
+  <li><b>Trending and analytics:</b> "most-used tags this week" and adoption reports. These may be a few minutes old.</li>
+  <li><i>Not ours:</i> who may edit an item (the product checks that before calling us), and full-text search of item
+    content.</li>
+</ul>
+<h3>How well it must do it (non-functional)</h3>
+<table>
+  <tr><th>Quality</th><th>Target</th></tr>
+  <tr><td>Consistency</td><td>Strong: a confirmed write is visible to everyone at once and is never lost</td></tr>
+  <tr><td>Latency</td><td>99% of reads under 20 ms; writes under 50 ms</td></tr>
+  <tr><td>Availability</td><td>99.95%. A database failure affects only that shard's tenants, and failover takes under 60 s</td></tr>
+  <tr><td>Isolation</td><td>Per-tenant rate limits, so one tenant can't starve the others</td></tr>
+  <tr><td>Limits</td><td>≤ 100 tags per item, ≤ 10,000 tags per tenant</td></tr>
+</table>
+</div>
+<div>
+<h3>Scale, and what each number forces</h3>
+<table>
+  <tr><th>Factor</th><th>Estimate</th><th>So we need…</th></tr>
+  <tr><td>Tenants</td><td>300k (avg ~13k items; whales 50M+)</td><td>tenant id in every key; whales on their own shards</td></tr>
+  <tr><td>Tagged items</td><td>4 billion</td><td>to store only references, not the items</td></tr>
+  <tr><td>Assignments</td><td>20 billion (~5 tags per item)</td><td>~4.5 TB for this table alone</td></tr>
+  <tr><td>Total data</td><td>≈ 6 TB (× 3 copies ≈ 18 TB)</td><td>more than one database (~1 TB comfortable), so we shard</td></tr>
+  <tr><td>Reads at peak</td><td>300k/s: 285k "tags of an item", 5k searches, 10k other</td><td>~19k/s per shard, which is ~25% of one primary</td></tr>
+  <tr><td>Writes at peak</td><td>30k/s (a whale's import: 100k links/s)</td><td>~1.9k transactions/s per shard ≈ 40%</td></tr>
+  <tr><td>Change events</td><td>30k/s × 400 B = 12 MB/s</td><td>a small Kafka cluster: 6 brokers, 48 partitions</td></tr>
+  <tr><td>Search index memory</td><td>~130 KB per typical tenant; 100–300 MB per whale</td><td>1–3 GB per server; whales on dedicated servers</td></tr>
+</table>
+<div class="box"><b>What we provision:</b> 16 shards (each 32 vCPU, 256 GB RAM, ~375 GB of data, ~2× headroom), each with
+2 standbys in other zones, plus 40 stateless service pods (4 vCPU each).
+<br/><b>The key insight:</b> because sharding leaves every primary only 25% busy, <b>we can afford to send every read
+to the primary</b>. That is what makes strong consistency cheap, and it's why there's no cache.</div>
+</div>
+</div>
+
+<!-- =============================================================== -->
+<h2>3. Technology choices and why</h2>
+<p>One rule: <b>open-source software with open protocols</b>, run on Kubernetes or as a compatible managed service on
+any cloud (e.g. PostgreSQL as RDS / Cloud SQL / CloudNativePG, Kafka as MSK / Confluent / Strimzi).</p>
+<table>
+  <tr><th>Need</th><th>Choice</th><th>Why this</th><th>Why not the alternative</th></tr>
+  <tr><td>Source of truth for tags and assignments</td><td><b>PostgreSQL 15+</b>, 16 shards split by tenant</td>
+      <td>Real transactions, unique constraints and synchronous replication. Each tenant on one shard means every write is local.</td>
+      <td>Cassandra: no multi-row transactions, and uniqueness is awkward. DynamoDB/Spanner: cloud-only.</td></tr>
+  <tr><td>Database failover</td><td><b>Patroni</b> or <b>CloudNativePG</b></td>
+      <td>Promotes a standby in under 60 s and <i>fences</i> (shuts out) the old primary, so there are never two writers.</td>
+      <td>Manual failover is slow. Async replicas can lose confirmed writes.</td></tr>
+  <tr><td>Connection pooling</td><td><b>PgBouncer</b></td>
+      <td>40 pods × 20 connections = 800, which it funnels into ~200 real database connections.</td>
+      <td>Raising Postgres <code>max_connections</code> wastes memory.</td></tr>
+  <tr><td>Change events</td><td><b>Apache Kafka</b> fed by a <b>transactional outbox</b></td>
+      <td>Events keep per-tenant order, many consumers can read them, and they can be replayed to rebuild anything derived.</td>
+      <td>"Write the DB, then publish": a crash in between loses the event. SQS/PubSub: cloud-only.</td></tr>
+  <tr><td>"Items with tag T", paged</td><td><b>PostgreSQL B-tree index</b> on <code>(tenant, tag, item number)</code></td>
+      <td>Updated in the same transaction as the data, so it's always exact.</td>
+      <td>No index means scanning every link the tenant has.</td></tr>
+  <tr><td>Combining tags (<code>bug AND p1 AND NOT done</code>)</td><td><b>RoaringBitmap</b> (Java library, in each pod's memory)</td>
+      <td>Intersects million-item sets in ~1 ms and gives the total count for free (§6).</td>
+      <td>SQL joins: seconds. Elasticsearch / OpenSearch: ~1 s behind, and it can't prove it's up to date (box below).</td></tr>
+  <tr><td>Trending tags</td><td><b>PostgreSQL</b> (a small separate database) fed from Kafka</td>
+      <td>Hourly and daily counts, updated exactly once per event.</td>
+      <td>Redis sorted sets: simple, but they can double-count on retries.</td></tr>
+  <tr><td>Analytics and reports</td><td><b>ClickHouse</b></td>
+      <td>Columnar storage scans billions of rows per second and compresses ~10×.</td>
+      <td>Querying the production primaries would hurt live traffic. BigQuery/Redshift: cloud-only.</td></tr>
+  <tr><td>Tag-name autocomplete</td><td><b>PostgreSQL</b> prefix index on <code>(tenant_id, name_norm)</code></td>
+      <td>At most 10,000 tags per tenant, so a prefix range scan is a few rows.</td>
+      <td>A search engine for this is overkill.</td></tr>
+  <tr><td>Service code</td><td><b>Java 17, Spring Boot 3</b>, JDBC, Flyway, Resilience4j</td>
+      <td>Explicit SQL (locking order matters), per-tenant rate limiters and bulkheads.</td>
+      <td>An ORM hides the SQL and the locking.</td></tr>
+  <tr><td>Edge and compute</td><td><b>Envoy</b> ingress, <b>Kubernetes</b>, OIDC/JWT tokens</td>
+      <td>The token is checked once at the edge. The same deployment runs on EKS, GKE or on-prem.</td>
+      <td>Cloud API gateways tie us to one cloud.</td></tr>
+  <tr><td>Monitoring</td><td><b>OpenTelemetry, Prometheus, Grafana</b></td><td>Vendor-neutral.</td><td>Cloud-only monitoring.</td></tr>
+</table>
+<div class="grid2">
+<div class="box"><b>"Why not put Redis in front?"</b> A cache is a second copy that can be stale. To keep it exact, every
+write would have to invalidate it before confirming, and Redis can lose that invalidation on failover. We don't need
+it anyway: the primary is only 25% busy, and the hot read is a 1–2 ms index lookup.</div>
+<div class="box"><b>"Why not Debezium (read the database log) instead of an outbox?"</b> It gives the same guarantee.
+The outbox gives us business-level events, the per-shard <code>seq</code> the read barrier needs, and one less cluster
+to run. Debezium can be swapped in later without changing consumers.</div>
+</div>
+<div class="box"><b>"Don't we need Elasticsearch?" No, not in the tagging service.</b> Elasticsearch (and OpenSearch)
+is an inverted index too, so it <i>could</i> answer <code>bug AND p1 AND NOT done</code>, but:
+<ul>
+  <li><b>It breaks read-your-writes.</b> A change becomes searchable only after a <i>refresh</i> (~1 s by default), after
+    the Kafka lag, and there is no cheap way to prove "this index has every change up to seq 9001 for this tenant".
+    The alternatives are making every write wait for a refresh (+~1 s) or returning stale results.</li>
+  <li><b>Its strengths go unused.</b> Tag search is pure set algebra on integer ids: no text analysis, relevance
+    ranking or fuzzy matching. That is exactly what a RoaringBitmap does, in ~1 ms, behind the watermark check.</li>
+  <li><b>It's a third copy to run.</b> 4 B item documents in another cluster (shards, replicas, reindexing,
+    upgrades), versus a few GB of RAM per pod rebuilt from Postgres.</li>
+</ul>
+<b>Where it can still appear:</b> outside this service. A product (e.g. Jira) that wants full-text search ("issues
+mentioning <i>login timeout</i> tagged <code>bug</code>") can feed its own OpenSearch index from our Kafka events, where
+~1 s of lag is fine. The tagging service never reads it. <b>I'd revisit</b> if search grew into text + tags + many
+other fields with ranking, or if the product accepted eventually-consistent search.</div>
+
+<!-- =============================================================== -->
+<h2>4. High-level design: the components and how API calls flow</h2>
+<div class="mermaid">
+flowchart TB
+  CL["<b>Products</b><br/>Jira · Confluence · Bitbucket"]
+  GW["<b>Ingress</b> · Envoy<br/>checks the login token (JWT)<br/>adds the tenant id · global rate limit"]
+  POD["<b>Tagging service</b> · Java / Spring Boot on Kubernetes<br/>40 identical pods · per-tenant rate limit<br/>Shard router: which shard holds this tenant?"]
+  IDX["<b>Search index</b> · RoaringBitmap<br/>in each pod's memory<br/>tag → set of item numbers"]
+  PB["<b>PgBouncer</b><br/>connection pool"]
+  PG[("<b>Shard primary</b> · PostgreSQL<br/>1 of 16 · zone A<br/>tags, items, assignments<br/>indexes · outbox")]
+  SB[("<b>Shard standbys</b><br/>zones B and C")]
+  PB --> PG
+  PG ==>|"copy every change<br/>before confirming"| SB
+  REL["<b>Outbox relay</b><br/>publishes changes in order"]
+  K[["<b>Kafka</b> · tag-events<br/>ordered per tenant · kept 7 days"]]
+  IA["Index updater<br/>(in every pod)"]
+  TA["Trending<br/>counter"]
+  AN["Analytics<br/>loader"]
+  PJ["Cleanup job<br/>(deleted tags)"]
+  TS[("Trending DB<br/>PostgreSQL")]
+  CH[("Analytics DB<br/>ClickHouse")]
+  CL --> GW --> POD
+  POD ==>|"A, B: every write and read"| PB
+  POD -->|"C: tag search"| IDX
+  PG -->|"D: change events"| REL --> K
+  K --> IA
+  K --> TA --> TS
+  K --> AN --> CH
+  K --> PJ
+  IA -.->|"keeps it up to date"| IDX
+  POD -.->|"E: trending (minutes old, by design)"| TS
+</div>
+
+<h3>How each kind of API call travels</h3>
+<div class="grid2">
+<div>
+<p><b>Every request</b> enters the same way: the product calls the ingress, which checks the user's login token and
+adds the <b>tenant id</b> taken from that token (never from the request body). Any pod can take the request. The pod
+applies the tenant's rate limit, then the shard router looks up which shard holds this tenant.</p>
+<p><b>A. Write</b>, e.g. attach <code>bug</code> to JIRA-42. The pod runs <b>one transaction</b> on the shard primary.
+It locks the item, checks the 100-tag limit, inserts the link, bumps the tag's usage counter, and writes an event row
+to the outbox. The primary confirms only after a standby in another zone has the change, and then the pod returns the
+item's new tag list.</p>
+<p><b>B. Read</b>, e.g. the tags of JIRA-42 (95% of traffic). This is one index lookup on the primary, in 1–2 ms.
+Because it's the primary, it always includes the latest write, whichever pod served that write.</p>
+</div>
+<div>
+<p><b>C. Tag search</b>, e.g. <code>bug AND p1 AND NOT done</code>. The pod asks the primary "what's the latest change
+number (<code>seq</code>) for this tenant?", which takes ~0.2 ms. If the pod's in-memory index has already applied that
+change, it answers from memory in ~1 ms. Otherwise it waits up to 50 ms for the index to catch up, then falls back to
+SQL on the primary, which is slower but exact.</p>
+<p><b>D. Change events.</b> The outbox relay publishes each shard's new outbox rows to Kafka in order, about 50 ms
+after commit. Four kinds of consumer read them:</p>
+<ul>
+  <li>each pod's index updater;</li>
+  <li>the trending counter;</li>
+  <li>the analytics loader;</li>
+  <li>the cleanup job that removes links to deleted tags.</li>
+</ul>
+<p>All of them can be rebuilt by replaying Kafka.</p>
+<p><b>E. Trending</b> reads the trending database and says in its response that the result is a few minutes old.
+This is the only read that isn't strongly consistent.</p>
+</div>
+</div>
+
+<p><b>A + B. Write, then read it back</b></p>
+<div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant P as Jira
+  participant S as Tagging pod
+  participant DB as Primary
+  participant SB as Standby
+  Note over P,SB: A. attach "bug" to JIRA-42
+  P->>S: POST …/42/tags:attach
+  S->>DB: 1 transaction:<br/>link + counter + outbox (seq 9001)
+  DB->>SB: copy the change
+  SB-->>DB: stored
+  DB-->>S: committed
+  S-->>P: 200 · tags [bug, …]
+  Note over P,DB: B. tags of JIRA-42
+  P->>S: GET …/42/tags
+  S->>DB: index lookup (1–2 ms)
+  S-->>P: 200 · includes "bug"
+</div>
+<p><b>D + C. Event reaches the index, then a search</b></p>
+<div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant P as Jira
+  participant S as Tagging pod
+  participant DB as Primary
+  participant I as Bitmap index
+  Note over DB,I: D. ~50 ms after commit
+  DB-)I: seq 9001 via relay + Kafka<br/>set JIRA-42's bit in "bug"
+  Note over P,I: C. search bug AND NOT done
+  P->>S: POST /v1/search
+  S->>DB: tenant's latest seq?
+  DB-->>S: 9001 (the barrier)
+  alt index has applied 9001
+    S->>I: bug AND NOT done (~1 ms)
+    S->>DB: page's numbers → item ids
+  else still behind after 50 ms
+    S->>DB: same query in SQL
+  end
+  S-->>P: 200 · items + total
+</div>
+
+<!-- =============================================================== -->
+<h2>5. Database model (inside each shard)</h2>
+<div class="mermaid">
+erDiagram
+  TAGS ||--o{ ENTITY_TAGS : "tag_id"
+  ENTITIES ||--o{ ENTITY_TAGS : "item"
+  TAGS ||--|{ TAG_USAGE : "counts"
+  TAGS {
+    varchar tenant_id PK
+    bigint tag_id PK
+    varchar name
+    varchar name_norm UK "bug = Bug"
+    bigint version "for safe edits"
+    boolean deleted
+  }
+  ENTITIES {
+    varchar tenant_id PK
+    varchar entity_type PK "jira:issue"
+    varchar entity_id PK "10042"
+    bigint entity_seq UK "item number"
+  }
+  ENTITY_TAGS {
+    varchar tenant_id PK
+    varchar entity_type PK
+    varchar entity_id PK
+    bigint tag_id PK
+    bigint entity_seq
+  }
+  TAG_USAGE {
+    varchar tenant_id PK
+    bigint tag_id PK
+    smallint bucket PK "0..15"
+    bigint cnt
+  }
+  OUTBOX {
+    bigint seq PK "change number"
+    varchar tenant_id
+    text payload "the event"
+  }
+</div>
+<div class="grid2">
+<div>
+<table>
+  <tr><th>Table</th><th>One row per…</th><th>Why it exists</th></tr>
+  <tr><td><code>tags</code></td><td>tag</td><td>The name, colour and a <code>version</code>, so two people editing at once
+      can't overwrite each other (the second gets HTTP 412). <code>name_norm</code> enforces "one <code>bug</code> per tenant".</td></tr>
+  <tr><td><code>entities</code></td><td>tagged item</td><td>Gives each item a small integer <code>entity_seq</code>, which
+      is its bit position in the search bitmaps (§6). Its row is also locked while tagging, which makes the 100-tag
+      limit exact.</td></tr>
+  <tr><td><code>entity_tags</code></td><td>item–tag link (20 B rows)</td><td>The core table. It stores <code>tag_id</code>,
+      not the name, so renaming a tag used 10M times changes one row.</td></tr>
+  <tr><td><code>tag_usage</code></td><td>tag × 16 buckets</td><td>Usage counts, split into 16 rows so a popular tag isn't
+      one hot row that every write fights over.</td></tr>
+  <tr><td><code>outbox</code></td><td>change</td><td>The event for each change, written in the same transaction, so data
+      and event can never disagree. Its <code>seq</code> numbers the shard's changes in order.</td></tr>
+</table>
+</div>
+<div>
+<ul class="note">
+  <li><b><code>tenant_id</code> is first in every key,</b> so a tenant's rows sit together on disk, and it's the shard key.</li>
+  <li><b>Deleting a tag</b> just sets <code>deleted</code>. A background job removes its links in batches, so deleting a
+    tag used 10M times returns instantly.</li>
+  <li><b>No foreign keys:</b> they would lock the tag row on every attach. The transaction checks that the tag exists instead.</li>
+</ul>
+</div>
+</div>
+
+<!-- =============================================================== -->
+<h2>6. Tag search: inverted index, bitmaps and boolean operations</h2>
+
+<h3>6.1 Why we need an inverted index: the table is sorted the wrong way for search</h3>
+<p><code>entity_tags</code> is sorted by item (its primary key starts with the item). That's perfect for the most
+common question, but useless for the reverse one. The running example on this page is <b>one tenant with 8 Jira
+issues</b>. When an issue is first tagged, the <code>entities</code> table gives it the next free number,
+<code>entity_seq</code>. Here JIRA-101 got 1, JIRA-102 got 2, and so on.</p>
+<div class="grid2">
+<div>
+<p><b>Forward index: item → tags</b> (what the product writes, and what <code>GET …/tags</code> reads)</p>
+<table>
+  <tr><th>Issue</th><th><code>entity_seq</code></th><th>Its tags</th></tr>
+  <tr><td>JIRA-101</td><td>1</td><td>bug, ui</td></tr>
+  <tr><td>JIRA-102</td><td>2</td><td>bug, p1, ui</td></tr>
+  <tr><td>JIRA-103</td><td>3</td><td>p1</td></tr>
+  <tr><td>JIRA-104</td><td>4</td><td>bug, p1, api, done</td></tr>
+  <tr><td>JIRA-105</td><td>5</td><td>bug, done</td></tr>
+  <tr><td>JIRA-106</td><td>6</td><td>ui</td></tr>
+  <tr><td>JIRA-107</td><td>7</td><td>bug, p1, api</td></tr>
+  <tr><td>JIRA-108</td><td>8</td><td>bug, p1</td></tr>
+</table>
+</div>
+<div>
+<p><b>Inverted index: tag → items</b> (the same links, flipped)</p>
+<table>
+  <tr><th>Tag</th><th>Items, as <code>entity_seq</code></th><th>i.e.</th></tr>
+  <tr><td><code>bug</code></td><td>1, 2, 4, 5, 7, 8</td><td>JIRA-101, 102, 104, 105, 107, 108</td></tr>
+  <tr><td><code>p1</code></td><td>2, 3, 4, 7, 8</td><td>JIRA-102, 103, 104, 107, 108</td></tr>
+  <tr><td><code>ui</code></td><td>1, 2, 6</td><td>JIRA-101, 102, 106</td></tr>
+  <tr><td><code>api</code></td><td>4, 7</td><td>JIRA-104, 107</td></tr>
+  <tr><td><code>done</code></td><td>4, 5</td><td>JIRA-104, 105</td></tr>
+</table>
+<p class="note"><b>How the right side is built:</b> go down the left table, and for every tag on a row, add that row's
+number to the tag's list. Example: JIRA-104 (number 4) has <code>bug, p1, api, done</code>, so 4 goes into the lists of
+all four tags. Each tag's list is called its <b>posting list</b>.</p>
+</div>
+</div>
+<table>
+  <tr><th>Question</th><th>Direction</th><th>With only the forward index</th><th>With an inverted index</th></tr>
+  <tr><td>"Tags of JIRA-42?" (285k/s)</td><td>item → tags</td><td>one short lookup ✔</td><td>(not needed)</td></tr>
+  <tr><td>"Issues tagged <code>bug</code>?"</td><td>tag → items</td><td>read <b>every</b> link of the tenant: 150M rows for a whale, tens of seconds ✘</td><td>one lookup, then read in order ✔</td></tr>
+  <tr><td>"<code>bug</code> AND <code>p1</code> AND NOT <code>done</code>?" (5k/s)</td><td>several tags → items</td><td>three full scans and a join ✘</td><td>combine three lists ✔</td></tr>
+</table>
+<div class="say">"Q1 is answered by the primary key. Q2 and Q3 ask the opposite direction and nothing answers them yet,
+so this is where I introduce an inverted index, the same structure a search engine uses: word → documents."</div>
+
+<h3>6.2 Boolean search is set algebra on the inverted index</h3>
+<p>Once each tag has its list of items (its <b>posting list</b>), every search is a combination of three set operations.
+The API's three fields map onto them directly:</p>
+<table>
+  <tr><th>API field</th><th>Meaning</th><th>Set operation</th><th>Bit operation</th><th>Example</th></tr>
+  <tr><td><code>all: [a, b]</code></td><td>has <b>every</b> one of these tags</td><td>intersection A ∩ B</td><td><b>AND</b> (1 only if both are 1)</td><td>bug AND p1</td></tr>
+  <tr><td><code>any: [a, b]</code></td><td>has <b>at least one</b> of these tags</td><td>union A ∪ B</td><td><b>OR</b> (1 if either is 1)</td><td>ui OR api</td></tr>
+  <tr><td><code>none: [a]</code></td><td>has <b>none</b> of these tags</td><td>difference R − A</td><td><b>AND NOT</b> (clear the bits that are 1 in A)</td><td>… AND NOT done</td></tr>
+  <tr><td><code>entityType</code></td><td>only this kind of item</td><td>intersection with the type's set</td><td><b>AND</b> with the "all Jira issues" bitmap</td><td>… AND jira:issue</td></tr>
+</table>
+<p>The service evaluates them in this order (<code>RoaringInvertedIndex.evaluate</code>):
+<code>result = AND(all) → AND OR(any) → AND NOT OR(none) → AND type</code>. It then counts the 1-bits for the total,
+and reads the page of item numbers after the cursor.</p>
+
+<h3>6.3 Worked example: the same 8 issues, one bit per issue</h3>
+<p>A tag's <b>bitmap</b> is its posting list from §6.1 written as a row of bits. Column <i>n</i> is the issue whose
+<code>entity_seq</code> is <i>n</i>, and the bit is 1 if that issue has the tag. So <code>bug</code>'s list
+1, 2, 4, 5, 7, 8 becomes <code>1 1 0 1 1 0 1 1</code>.</p>
+<p><b>Query:</b> <code>POST /v1/search {"all":["bug","p1"], "any":["ui","api"], "none":["done"]}</code>, which means
+"open p1 bugs in the UI or the API".</p>
+<table class="bits">
+  <tr><th>Bitmap</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th><th>7</th><th>8</th><th>Operation</th></tr>
+  <tr><td><code>bug</code></td><td class="one">1</td><td class="one">1</td><td>0</td><td class="one">1</td><td class="one">1</td><td>0</td><td class="one">1</td><td class="one">1</td><td class="op">posting list of bug: {1,2,4,5,7,8}</td></tr>
+  <tr><td><code>p1</code></td><td>0</td><td class="one">1</td><td class="one">1</td><td class="one">1</td><td>0</td><td>0</td><td class="one">1</td><td class="one">1</td><td class="op">{2,3,4,7,8}</td></tr>
+  <tr class="res"><td><b>① bug AND p1</b></td><td>0</td><td class="one">1</td><td>0</td><td class="one">1</td><td>0</td><td>0</td><td class="one">1</td><td class="one">1</td><td class="op"><b>all</b>: keep bits that are 1 in both → {2,4,7,8}</td></tr>
+  <tr><td><code>ui</code></td><td class="one">1</td><td class="one">1</td><td>0</td><td>0</td><td>0</td><td class="one">1</td><td>0</td><td>0</td><td class="op"></td></tr>
+  <tr><td><code>api</code></td><td>0</td><td>0</td><td>0</td><td class="one">1</td><td>0</td><td>0</td><td class="one">1</td><td>0</td><td class="op"></td></tr>
+  <tr class="res"><td><b>② ui OR api</b></td><td class="one">1</td><td class="one">1</td><td>0</td><td class="one">1</td><td>0</td><td class="one">1</td><td class="one">1</td><td>0</td><td class="op"><b>any</b>: 1 if either is 1 → {1,2,4,6,7}</td></tr>
+  <tr class="res"><td><b>③ ① AND ②</b></td><td>0</td><td class="one">1</td><td>0</td><td class="one">1</td><td>0</td><td>0</td><td class="one">1</td><td>0</td><td class="op">{2,4,7}</td></tr>
+  <tr><td><code>done</code></td><td>0</td><td>0</td><td>0</td><td class="one">1</td><td class="one">1</td><td>0</td><td>0</td><td>0</td><td class="op"></td></tr>
+  <tr><td><b>NOT done</b></td><td class="one">1</td><td class="one">1</td><td class="one">1</td><td>0</td><td>0</td><td class="one">1</td><td class="one">1</td><td class="one">1</td><td class="op">flip every bit of <code>done</code>: 1 = "not done" → {1,2,3,6,7,8}</td></tr>
+  <tr><td>③ again</td><td>0</td><td class="one">1</td><td>0</td><td class="one">1</td><td>0</td><td>0</td><td class="one">1</td><td>0</td><td class="op">{2,4,7}</td></tr>
+  <tr class="res"><td><b>④ ③ AND (NOT done)</b></td><td>0</td><td class="hit">1</td><td>0</td><td>0</td><td>0</td><td>0</td><td class="hit">1</td><td>0</td><td class="op"><b>none</b>: keep bits that are 1 in ③ <i>and</i> 1 in NOT done. Number 4 (JIRA-104) is dropped because it is done → <b>{2, 7}</b></td></tr>
+</table>
+<p class="note"><b>AND NOT</b> (also called <i>and-not</i> or set difference, <code>③ − done</code>) is two steps in one:
+flip the bits of <code>done</code> (NOT), then AND the result with ③. Per bit: <code>1 AND NOT 0 = 1</code> (keep),
+<code>1 AND NOT 1 = 0</code> (drop), and <code>0 AND NOT x = 0</code> (wasn't a match anyway). RoaringBitmap does this as a single
+<code>andNot(③, done)</code> call, and never builds the flipped bitmap, because "not done" would include every other item
+in the tenant.</p>
+<p><b>Answer:</b> numbers 2 and 7, <code>total = 2</code> (just count the 1-bits). The pod turns the numbers of
+the page back into issues with one indexed query, <code>entities WHERE entity_seq IN (2, 7)</code>, and returns
+<code>[JIRA-102, JIRA-107]</code>. You can check it against §6.1: both are p1 bugs touching ui or api, and JIRA-104
+is left out because it is <code>done</code>. For the next page, the cursor is "after number 7".</p>
+
+<div class="grid2">
+<div>
+<p><b>Why this is fast.</b> A CPU does AND / OR / AND NOT on <b>64 bits in one instruction</b>. So a whale's tag
+with 10M items is ~156k instructions, a fraction of a millisecond, instead of reading 10M rows from disk.</p>
+<p><b>The same query in SQL</b> (the fallback) has to walk each tag's B-tree list and match them up:</p>
+<pre><code>SELECT entity_seq FROM entity_tags WHERE tenant_id=? AND tag_id = :bug
+INTERSECT
+SELECT entity_seq FROM entity_tags WHERE tenant_id=? AND tag_id = :p1
+INTERSECT
+SELECT entity_seq FROM entity_tags WHERE tenant_id=? AND tag_id IN (:ui, :api)
+EXCEPT
+SELECT entity_seq FROM entity_tags WHERE tenant_id=? AND tag_id = :done
+ORDER BY entity_seq LIMIT 50;</code></pre>
+<p>That's correct, but on <code>bug</code>(5M) and <code>p1</code>(2M) and <code>done</code>(3M) it reads ~10M index
+entries (~450 MB), which takes <b>seconds</b> and loads the primary that serves every other read.</p>
+</div>
+<div>
+<p><b>What "Roaring" adds: compression.</b> A plain bitmap needs one bit per possible item, so a whale with 50M items
+needs 6 MB <i>per tag</i>, even for a tag on 3 items. With 10,000 tags that's 60 GB. RoaringBitmap fixes this:</p>
+<ol>
+  <li>It splits the item numbers into <b>chunks of 65,536</b> (numbers 0–65,535, 65,536–131,071, …).</li>
+  <li>For each chunk it picks the smallest of three formats:
+    <ul>
+      <li><b>array</b>, for few items: just the numbers, 2 bytes each (a tag on 3 items ≈ 6 bytes);</li>
+      <li><b>bitmap</b>, for many items: a fixed 8 KB of bits;</li>
+      <li><b>runs</b>, for long ranges: "items 1,000 to 40,000" in 4 bytes.</li>
+    </ul></li>
+  <li>Chunks with no items take <b>no space</b>.</li>
+  <li>AND works chunk by chunk, and skips any chunk that is missing on one side.</li>
+</ol>
+<p>Result: ~0.1–2 bytes per link instead of ~45 bytes in a B-tree. That's ~130 KB for a typical tenant, and
+100–300 MB for a whale, so it fits in a pod's memory.</p>
+</div>
+</div>
+
+<h3>6.4 Where the inverted index lives: two copies, each good at one job</h3>
+<table>
+  <tr><th></th><th>Forward index (primary key)</th><th>① B-tree inverted index</th><th>② RoaringBitmap inverted index</th></tr>
+  <tr><td>What it is</td><td><code>entity_tags</code> sorted by item</td><td>A Postgres index on <code>entity_tags (tenant_id, tag_id, entity_seq)</code></td><td>One compressed bitmap per (tenant, tag), plus one per item type</td></tr>
+  <tr><td>Lives in</td><td>Shard database</td><td>Shard database</td><td>Each pod's memory (whales on dedicated pods)</td></tr>
+  <tr><td>Good at</td><td>Tags of an item</td><td><b>One tag, in order, a page at a time</b>: page 3 of <code>bug</code> reads 51 entries after page 2's last item (<i>keyset paging</i>)</td><td><b>Combining whole lists</b>: AND / OR / AND NOT and counts over millions of items</td></tr>
+  <tr><td>Kept up to date by</td><td>The write transaction</td><td>The write transaction</td><td>Kafka events, ~50 ms behind; built at start-up by scanning the tenant's links</td></tr>
+  <tr><td>Always correct because</td><td>Same transaction</td><td>Same transaction</td><td>Used only when watermark ≥ barrier (below)</td></tr>
+  <tr><td>Serves the API</td><td><code>GET …/entities/{type}/{id}/tags</code></td><td><code>GET /v1/tags/{id}/entities</code>; search fallback</td><td><code>POST /v1/search</code></td></tr>
+</table>
+<p>The bitmaps live in the pods, not the database, because set algebra is CPU work, and pods are cheap to add.</p>
+
+<h3>6.5 How the in-memory copy stays correct: the read barrier</h3>
+<p>The bitmaps are a <b>copy</b>, updated from Kafka about 50 ms after each change, so they could be slightly
+behind. We never let that show:</p>
+<ol>
+  <li>Every change in a shard gets an increasing number, <code>seq</code>, in the outbox, committed with the change.</li>
+  <li>Each pod's index remembers the last <code>seq</code> it has applied for each tenant (its <b>watermark</b>).</li>
+  <li>Before a search, the pod asks the primary for the tenant's latest <code>seq</code>, the <b>barrier</b>
+    (one tiny indexed query, ~0.2 ms).</li>
+  <li><b>If watermark ≥ barrier,</b> the copy includes every confirmed change, so it answers from memory.</li>
+  <li><b>If not,</b> it waits up to 50 ms for the copy to catch up, and otherwise answers with the SQL above. The
+    response header <code>X-Served-By: index | store</code> says which one answered.</li>
+</ol>
+<div class="mermaid">
+flowchart LR
+  Q["POST /v1/search"] --> B["Ask primary:<br/>tenant's latest seq<br/>(barrier = 9001)"]
+  B --> C{"index watermark<br/>≥ 9001?"}
+  C -->|yes| M["Bitmaps: AND / OR / AND NOT<br/>~1 ms · X-Served-By: index"]
+  C -->|"no: wait ≤ 50 ms"| C2{"caught up?"}
+  C2 -->|yes| M
+  C2 -->|no| S["SQL on the B-tree<br/>exact, slower · X-Served-By: store"]
+</div>
+<p class="note"><b>Rejected:</b> a Postgres GIN index over a <code>tags[]</code> array column (every attach rewrites the
+item's row, and AND still reads whole lists from disk); Elasticsearch / OpenSearch (about 1 s behind, with no way
+to prove it has caught up; see §3).</p>
+
+<!-- =============================================================== -->
+<h2>7. API design and how the calls work together</h2>
+<div class="grid2">
+<div>
+<table>
+  <tr><th>Call</th><th>What it does</th><th>Served by</th></tr>
+  <tr><th colspan="3">Tags</th></tr>
+  <tr><td><code>POST /v1/tags</code> <code>{name, color}</code></td><td>Create a tag. 409 if the name exists</td><td>primary</td></tr>
+  <tr><td><code>GET /v1/tags?prefix=bu</code></td><td>Autocomplete names</td><td>primary, name index</td></tr>
+  <tr><td><code>PATCH /v1/tags/{id}</code> + <code>If-Match</code></td><td>Rename or recolour. 412 if someone changed it first</td><td>primary</td></tr>
+  <tr><td><code>DELETE /v1/tags/{id}</code></td><td>Delete now; links cleaned up in the background</td><td>primary + cleanup job</td></tr>
+  <tr><th colspan="3">Tags on an item</th></tr>
+  <tr><td><code>GET /v1/entities/{type}/{id}/tags</code></td><td>The item's tags (<b>hot path</b>)</td><td>primary, forward index</td></tr>
+  <tr><td><code>POST …/tags:attach</code> <code>{tagIds | tagNames}</code></td><td>Add tags; creates new names</td><td>primary, one transaction</td></tr>
+  <tr><td><code>POST …/tags:detach</code> <code>{tagIds}</code></td><td>Remove tags</td><td>primary, one transaction</td></tr>
+  <tr><td><code>PUT …/tags</code> <code>{tagIds}</code></td><td>Replace the whole set</td><td>primary, one transaction</td></tr>
+  <tr><td><code>POST /v1/tags:bulkAttach</code> + <code>Idempotency-Key</code></td><td>Tag ≤ 500 items × 50 tags</td><td>primary, batched</td></tr>
+  <tr><th colspan="3">Finding items</th></tr>
+  <tr><td><code>GET /v1/tags/{id}/entities?cursor=</code></td><td>Items with one tag, paged</td><td>primary, ① B-tree</td></tr>
+  <tr><td><code>POST /v1/search</code> <code>{all, any, none, entityType}</code></td><td>Combine tags (AND / OR / AND NOT), with a total</td><td>② bitmaps, or ① if behind</td></tr>
+  <tr><td><code>GET /v1/tags:trending?window=7d</code></td><td>Most-used tags (marked <code>EVENTUAL</code>)</td><td>trending DB</td></tr>
+</table>
+</div>
+<div>
+<p><b>One user story, end to end</b> (a Jira user labels an issue, then filters the board):</p>
+<ol>
+  <li>The user types <code>bu</code>, and Jira calls <code>GET /v1/tags?prefix=bu</code>, which suggests <code>bug</code>.</li>
+  <li>The user picks it. Jira calls <code>POST /v1/entities/jira:issue/42/tags:attach {"tagNames":["bug"]}</code>.
+    In one transaction the service creates <code>bug</code> if it's new and attaches it. The response is the issue's
+    new tag list.</li>
+  <li>The page reloads and calls <code>GET /v1/entities/jira:issue/42/tags</code>. Whichever pod serves it reads the
+    primary, so <code>bug</code> is there.</li>
+  <li>The user filters the board, and Jira calls <code>POST /v1/search {"all":["bug"],"none":["done"]}</code>. The
+    read barrier guarantees the result includes JIRA-42.</li>
+  <li>The user opens "all <code>bug</code> issues", and Jira pages through
+    <code>GET /v1/tags/{bug}/entities?cursor=…</code>.</li>
+  <li>About 50 ms after step 2, the same event reaches trending and analytics, plus any product that chose to consume it (e.g. its own full-text index).</li>
+</ol>
+<h3>Rules every call follows</h3>
+<ul>
+  <li><b>Tenant from the token:</b> the ingress sets <code>X-Tenant-Id</code>, so a caller can never reach another tenant's data.</li>
+  <li><b>Safe to retry:</b> attach and detach are set operations, so doing them twice changes nothing.
+    Only bulk attach needs an <code>Idempotency-Key</code>, so that a retry returns the same response.</li>
+  <li><b>Strong by default:</b> callers can opt into <code>consistency=EVENTUAL</code>, for example for exports.</li>
+  <li><b>Paging</b> uses an opaque <code>cursor</code> (the last item number seen) and a <code>limit</code> of at most 200.</li>
+  <li><b>Errors</b> are standard problem JSON (RFC 7807). <code>429</code> and <code>503</code> carry <code>Retry-After</code>.</li>
+</ul>
+</div>
+</div>
+
+<!-- =============================================================== -->
+<h2>8. How this compares with the Medium design</h2>
+<table>
+  <tr><th>Topic</th><th>Medium article</th><th>This design</th><th>Why it matters</th></tr>
+  <tr><td>Scale</td><td>10M daily users, 100M requests/day (~925 reads/s, ~231 writes/s)</td><td>300k reads/s and 30k writes/s at peak, 6 TB</td><td>Size for the peak, not the daily average</td></tr>
+  <tr><td>Consistency</td><td>Eventual: writes queued in Kafka, Redis cache with TTL, async read replicas</td><td>Strong: primary reads, confirmed only once a standby has the change</td><td>A user must see the tag they just added</td></tr>
+  <tr><td>Write path</td><td>API → Kafka → worker → DB, acknowledged before it's saved</td><td>One DB transaction; the event comes from the outbox</td><td>A confirmed write is never lost</td></tr>
+  <tr><td>Sharding</td><td><code>hash(tag_id + product) % N</code></td><td>By tenant</td><td>Sharding by tag scatters one item's tags over every shard, so the hot "tags of an item" call has to ask them all</td></tr>
+  <tr><td>Tag search</td><td>By name through the cache; no combining of tags</td><td>Boolean <code>all / any / none</code> in ~1 ms</td><td>That's the reason for the bitmap index</td></tr>
+  <tr><td>Trending</td><td>Redis sorted set (<code>ZINCRBY</code>) + a 10-minute job for the top 50</td><td>Kafka → trending DB, counted exactly once</td><td><b>Theirs is simpler</b>: a fine choice if approximate counts are OK</td></tr>
+  <tr><td>Multi-tenancy</td><td>Not covered; tag names are global</td><td>Tenant in every key, per-tenant limits, own shards for whales</td><td>With 300k tenants, noisy neighbours are the main risk</td></tr>
+</table>
+
+</body>
+</html>

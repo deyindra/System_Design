@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Running Task Graphs in Parallel: From Threads in One JVM to Workers on Many VMs</title>
+<style>
+  body { font-family: Georgia, "Times New Roman", serif; font-size: 21px; max-width: 980px; margin: 40px auto;
+         padding: 0 24px; line-height: 1.65; color: #222; }
+  h1 { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 2.3em; line-height: 1.2; margin-bottom: .2em; }
+  h3 { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 1.2em; margin-top: 1.4em; }
+  h2 { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 1.5em; margin-top: 1.8em; }
+  .subtitle { color: #666; font-size: 1.1em; margin-top: 0; }
+  code { font-family: Menlo, Consolas, monospace; font-size: .9em; background: #f3f3f3; padding: 1px 4px; border-radius: 3px; }
+  pre { background: #1e1e1e; color: #e6e6e6; padding: 14px 16px; border-radius: 6px; overflow-x: auto; line-height: 1.45; }
+  pre code { background: none; color: inherit; padding: 0; font-size: .82em; }
+  .mermaid { background: #fafafa; border: 1px solid #e5e5e5; border-radius: 6px; padding: 16px; margin: 22px 0; text-align: center; }
+  .mermaid svg { max-width: 100% !important; height: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: .9em; margin: 16px 0; }
+  th, td { border: 1px solid #ddd; padding: 7px 9px; text-align: left; vertical-align: top; }
+  th { background: #f5f5f5; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+  blockquote { border-left: 4px solid #4a7bd1; margin: 18px 0; padding: 4px 16px; color: #444; background: #f6f9ff; }
+  .caption { text-align: center; color: #777; font-size: .9em; margin-top: -8px; }
+</style>
+<script src="mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "neutral",
+    themeVariables: { fontSize: "20px" },
+    flowchart: { useMaxWidth: false, nodeSpacing: 40, rankSpacing: 55, padding: 14 }
+  });
+</script>
+</head>
+<body>
+
+<h1>Running Task Graphs in Parallel: From Threads in One JVM to Workers on Many VMs</h1>
+<p class="subtitle">Running a dependency graph of tasks in parallel: first across threads in one JVM, then across
+processes on many VMs, without changing the code you write.</p>
+
+<h2>At a glance</h2>
+
+<p>Take one graph with nine tasks. An arrow means "must finish before". It falls into three groups that share no
+edge, so they can't affect each other:</p>
+
+<div class="mermaid">
+flowchart TB
+    subgraph C["Group C: on its own"]
+        direction LR
+        notify["notify<br/>wave 1"]
+    end
+    subgraph B["Group B: data load"]
+        direction LR
+        fetch["fetch<br/>wave 1"] --> parse["parse<br/>wave 2"]
+        fetch --> validate["validate<br/>wave 2"]
+        parse --> load["load<br/>wave 3"]
+        validate --> load
+    end
+    subgraph A["Group A: build"]
+        direction LR
+        compile["compile<br/>wave 1"] --> test["test<br/>wave 2"]
+        lint["lint<br/>wave 1"] --> test
+        test --> pkg["package<br/>wave 3"]
+    end
+    classDef a fill:#dbeafe,stroke:#3b6fd1,color:#111
+    classDef b fill:#dcfce7,stroke:#2f9e57,color:#111
+    classDef c fill:#fef3c7,stroke:#c99a12,color:#111
+    class compile,lint,test,pkg a
+    class fetch,parse,validate,load b
+    class notify c
+</div>
+<p class="caption">Three independent groups; a "wave" is when a task can start.</p>
+
+<table>
+  <tr><th>What runs in parallel</th><th>Why</th></tr>
+  <tr><td><b>Groups A, B and C</b>, from the first moment</td>
+      <td>No edge connects them, so no group ever waits for another. Each gets its own thread.</td></tr>
+  <tr><td><b>compile and lint</b> (in A); <b>parse and validate</b> (in B)</td>
+      <td>Inside a group, a task starts as soon as its own dependencies finish, not when a whole level does.</td></tr>
+  <tr><td>Only <b>test</b>, <b>package</b> and <b>load</b> wait</td>
+      <td>They depend on other tasks. Nine tasks finish in three waves instead of nine sequential steps.</td></tr>
+  <tr><td>A failure in A</td>
+      <td>Stops only A's remaining tasks. B and C still finish.</td></tr>
+</table>
+
+<p>The rest of this article shows how one design delivers this on threads in one JVM, and on worker processes
+spread across many VMs.</p>
+
+<p>Build pipelines, data workflows, crawl plans and deployment rollouts share a shape: <b>tasks with
+dependencies</b>. An edge <code>a → b</code> means "a before b". The textbook answer is Kahn's topological sort:
+run whatever has no unfinished dependencies, then repeat. But a real graph is rarely one tangle. It's usually many
+<b>independent subgraphs</b> that never affect each other, and they're the easiest parallelism you'll find.</p>
+
+<p>This article walks through <code>graphexecutor</code>, a small pure-JDK library built on that idea. It covers
+the single-VM design and how the same design stretches to a cluster of worker processes.</p>
+
+<h2>1. The key idea: find the independent groups first</h2>
+
+<p>Two tasks can affect each other only if some chain of edges connects them, in <i>either</i> direction. In
+<code>a → c ← b</code>, a and b never point at each other, but both feed c, so they belong together. The right
+unit is a <b>weakly connected component</b>, not a strongly connected one (that would wrongly split a and b).</p>
+
+<p>One BFS over the graph, following edges both ways, finds every group in O(V + E). From then on each group is
+its own little topological run, and the groups run concurrently.</p>
+
+<div class="mermaid">
+flowchart TB
+    G["Task graph"] --> F["findGroups<br/>BFS both directions, O(V+E)"]
+    F --> S1["Group 0<br/>private subgraph copy"]
+    F --> S2["Group 1<br/>private subgraph copy"]
+    F --> S3["Group 2<br/>private subgraph copy"]
+    S1 --> V["validateGroup<br/>cycle check, before anything runs"]
+    S2 --> V
+    S3 --> V
+    V -->|eligible| P1["Kahn's on groupPool thread<br/>ready tasks run on taskPool"]
+    V -->|eligible| P2["Kahn's on groupPool thread<br/>ready tasks run on taskPool"]
+    V -->|cyclic| X["rejected group<br/>(or whole graph, by policy)"]
+    P1 --> R["GroupResult per group:<br/>value or error"]
+    P2 --> R
+    X --> R
+</div>
+<p class="caption">Single VM: split, snapshot, validate, then dispatch.</p>
+
+<h2>2. Single VM: multi-threaded by design</h2>
+
+<p><code>TaskExecutor</code> is a template method. Its final <code>submit</code> owns the orchestration, and a
+subclass supplies the work. <code>TopologicalTaskExecutor</code> is the ready-made subclass for "a before b"
+graphs. Four decisions make it safe to run concurrently:</p>
+
+<ul>
+  <li><b>Snapshot before dispatch.</b> Each group gets its own copy of its subgraph, made on the calling thread.
+    Worker threads never read the shared, non-thread-safe graph, and the caller can modify it as soon as
+    <code>submit</code> returns.</li>
+  <li><b>Validate everything before running anything.</b> A dry run of Kahn's algorithm (counters only) detects
+    cycles per group. With <code>REJECT_GRAPH</code>, one cyclic group means nothing runs. With
+    <code>ISOLATE_GROUP</code>, only that group is rejected.</li>
+  <li><b>Parallel inside a group, too.</b> A task is submitted the moment its last dependency finishes: Kahn's
+    ready set, driven by completions. Counters live in one <code>AtomicIntegerArray</code> and adjacency in
+    <code>int[][]</code>. Each decrement follows a task that is orders of magnitude slower, so contention on the
+    counters is negligible.</li>
+  <li><b>Two pools, on purpose.</b> Each group's coordinator blocks until its group finishes. If coordinators and
+    tasks shared one fixed pool, the coordinators could take every thread and starve their own tasks, so the
+    executor refuses a shared pool.</li>
+</ul>
+
+<p>The node <i>is</i> the task. <code>TopologicalTaskExecutor&lt;T&gt;</code> is generic in the node type, and
+<code>executeTask(T)</code> receives the node itself, so a node can carry everything its work needs. Here a
+record does, and its <code>equals</code>/<code>hashCode</code> come from its fields:</p>
+
+<pre><code>record Step(String id, String command) { }
+
+Step compile = new Step("compile", "mvn -q compile");
+Step test    = new Step("test",    "mvn -q test");
+Step pack    = new Step("package", "mvn -q package -DskipTests");
+Step fetch   = new Step("fetch",   "curl -sO https://example.com/data.csv");
+Step parse   = new Step("parse",   "python3 parse.py data.csv");
+
+Graph&lt;Step&gt; g = Graph.directed();
+g.addEdge(compile, test);      // compile before test
+g.addEdge(test, pack);         // test before package
+g.addEdge(fetch, parse);       // an independent group: runs alongside the build
+
+ExecutorService groupPool = Executors.newFixedThreadPool(4);   // group coordinators
+ExecutorService taskPool  = Executors.newFixedThreadPool(16);  // the tasks
+
+TopologicalTaskExecutor&lt;Step&gt; executor = new TopologicalTaskExecutor&lt;&gt;(
+        groupPool, taskPool, IneligibleGroupPolicy.ISOLATE_GROUP) {
+    @Override
+    protected void executeTask(Step step) throws Exception {
+        // every step this one depends on has already finished
+        Process p = new ProcessBuilder("sh", "-c", step.command()).inheritIO().start();
+        if (p.waitFor() != 0) {
+            // an exception fails this group only
+            throw new IllegalStateException(step.id() + " exited with " + p.exitValue());
+        }
+    }
+};
+
+for (GroupResult&lt;Step, List&lt;Step&gt;&gt; r : executor.execute(g)) {
+    String outcome = r.isSuccess() ? "done" : String.valueOf(r.error());
+    System.out.println("group " + r.group().id() + ": " + outcome);
+}</code></pre>
+
+<p>Failure is isolated. An exception becomes that group's <code>GroupResult</code>, and every other group
+still finishes.</p>
+
+<h2>3. Multi-VM: the same algorithm, as rounds</h2>
+
+<p>Past one machine, shared atomic counters stop working. The fix is the model Pregel popularized:
+<b>bulk-synchronous rounds over shards</b>. There are two questions: where each task lives, and who runs it
+when.</p>
+
+<h3>How the graph is sharded</h3>
+
+<ul>
+  <li><b>A node's shard is a pure function of its key:</b> <code>shard = floorMod(key.hashCode(), SHARDS)</code>.
+    <code>String.hashCode</code> is fixed by the JDK spec, so every VM computes the same answer without asking
+    anyone. There's no directory of nodes to keep in sync.</li>
+  <li><b>The loader writes the shard onto each vertex</b> in AGE or Neo4j, and indexes <code>(shard, key)</code>.
+    A worker then pages through only its own shards, a batch at a time. No VM ever holds the whole graph.</li>
+  <li><b>Edges may cross shards.</b> That's expected. A cross-shard edge just turns into a message between rounds.</li>
+  <li><b>Workers lease shards, not nodes.</b> Each worker claims up to <code>SHARDS_PER_WORKER</code> shards with
+    a lease in the database and renews it with a heartbeat. If a worker dies, its leases expire and the survivors
+    claim its shards. A shard keeps no state between rounds, so nothing has to be handed over.</li>
+</ul>
+
+<p>Here is the nine-task graph from "At a glance", hashed into 4 shards and run by 2 workers. The shard
+placement below is illustrative, since the real one comes from the hash:</p>
+
+<div class="mermaid">
+flowchart LR
+    K["task key<br/>e.g. &quot;compile&quot;"] --> H["floorMod(hash, 4)"]
+    H --> S0["shard 0<br/>compile, parse"]
+    H --> S1["shard 1<br/>lint, load"]
+    H --> S2["shard 2<br/>test, fetch"]
+    H --> S3["shard 3<br/>package, validate, notify"]
+    S0 -->|lease| W1["Worker 1<br/>VM 1"]
+    S1 -->|lease| W1
+    S2 -->|lease| W2["Worker 2<br/>VM 2"]
+    S3 -->|lease| W2
+    classDef w1 fill:#dbeafe,stroke:#3b6fd1,color:#111
+    classDef w2 fill:#dcfce7,stroke:#2f9e57,color:#111
+    class S0,S1,W1 w1
+    class S2,S3,W2 w2
+</div>
+<p class="caption">Key → shard by hash; shard → worker by lease. A group's tasks scatter over shards, and every
+cross-shard edge (compile → test, fetch → parse, ...) becomes a message.</p>
+
+<h3>Where the state lives: GraphStore, CompletionLog, ClusterStore</h3>
+
+<p>No VM keeps dependency state in memory between rounds. Everything the workers share lives in three stores,
+behind three small interfaces. They answer three different questions:</p>
+
+<table>
+  <tr><th></th><th><code>GraphStore</code></th><th><code>CompletionLog</code></th><th><code>ClusterStore</code></th></tr>
+  <tr><td>Answers</td><td><b>What</b> is the work? Which task depends on which?</td>
+      <td><b>What has finished,</b> and how?</td><td><b>Who</b> runs what, and <b>when</b> does the round end?</td></tr>
+  <tr><td>Holds</td><td>nodes with their key and shard, and the edges</td>
+      <td>one outcome per task: DONE or FAILED, the round, the error</td>
+      <td>run state (current round), shard leases, messages between shards, arrivals, attempt counts</td></tr>
+  <tr><td>Changes?</td><td>never during a run: read-only, written once by the loader</td>
+      <td>append-only: the first outcome per task wins</td>
+      <td>constantly: every round, every heartbeat</td></tr>
+  <tr><td>Scope</td><td>the graph; reused by many runs</td><td>one run (keyed by run id)</td>
+      <td>one run (keyed by run id)</td></tr>
+  <tr><td>Size</td><td>the whole graph, which is the reason it's in a database</td><td>grows to one row per task</td>
+      <td>small: per round, one batch per pair of shards</td></tr>
+  <tr><td>Key calls</td><td><code>sources(shard)</code>, <code>nodes(shard)</code>,
+      <code>predecessors(batch)</code>, <code>successors(batch)</code></td>
+      <td><code>record(task, outcome)</code>, <code>outcomes(batch)</code></td>
+      <td><code>claim</code>/<code>renew</code>, <code>send</code>/<code>inbox</code>,
+      <code>arrive</code>, <code>advance</code></td></tr>
+  <tr><td>In Apache AGE</td><td>the AGE graph (Cypher)</td><td><code>completion_log</code> table</td>
+      <td><code>cluster_run</code>, <code>cluster_lease</code>, <code>cluster_message</code>,
+      <code>cluster_arrival</code>, <code>cluster_attempt</code> tables</td></tr>
+  <tr><td>In Neo4j</td><td>labelled nodes and relationships</td><td><code>Outcome</code> nodes</td>
+      <td><code>ClusterRun</code>, <code>ClusterLease</code>, <code>ClusterMessage</code>, ... nodes</td></tr>
+</table>
+
+<p>How each scale uses them:</p>
+
+<ul>
+  <li><b>Single VM:</b> none of them. The graph is an in-memory <code>Graph</code>, and the counters are an
+    <code>AtomicIntegerArray</code>. If a stored graph turns out to be small, <code>GraphStore.load</code> reads it
+    into a <code>Graph</code> for the single-VM executors.</li>
+  <li><b>Simulated partitions in one JVM</b> (<code>DistributedTopologicalExecutor</code>): an in-memory
+    <code>CompletionLog</code>, plus an in-memory transport in place of the <code>ClusterStore</code>.</li>
+  <li><b>Many VMs</b> (<code>Worker</code>): all three, in a database every worker can reach. In practice that's the
+    graph's own database, so <b>the database is the network</b>: workers never talk to each other directly.
+    Tests use <code>InMemoryGraphStore</code>, <code>InMemoryCompletionLog</code> and
+    <code>InMemoryClusterStore</code>, with threads standing in for VMs.</li>
+</ul>
+
+<p>Split this way, each store gets the treatment it needs. The big, static graph is sharded and read in
+batches. The log is the only state that has to survive a crash. The small, hot coordination data can depend on
+the store's own clock and compare-and-set.</p>
+
+<h3>How dependencies are managed, without counters</h3>
+
+<p>Dependencies are simply the edges in the <code>GraphStore</code>, and progress is the
+<code>CompletionLog</code>. A task is ready when every one of its predecessors is logged DONE:</p>
+
+<blockquote><code>ready(v) ⇔ every u ∈ predecessors(v) has a DONE outcome from an earlier round</code></blockquote>
+
+<p>Each round, every shard runs the same six steps:</p>
+
+<pre><code>1. CANDIDATES  round 0: GraphStore.sources(myShard)    my tasks with no predecessors
+               round r: ClusterStore.inbox(r-1, myShard) task keys other shards sent me
+
+2. READY?      for each batch of candidates:
+                 preds = GraphStore.predecessors(batch)
+                 done  = CompletionLog.outcomes(preds)
+               keep t if every predecessor is DONE from an earlier round
+               otherwise drop t; nothing is remembered
+
+3. RUN         executeTask(t) for each ready task (one by one on this shard's thread)
+
+4. LOG         CompletionLog.record(t, DONE or FAILED, r)    before any message about t
+
+5. NOTIFY      for each task that is DONE: GraphStore.successors(...)
+               group the successors by owner shard = hash(key)
+               ClusterStore.send(r, myShard, toShard, keys)  one batch per destination
+
+6. ARRIVE      ClusterStore.arrive(r, myShard)
+               ClusterStore.advance(r)   the first call that finds every shard
+                                         arrived starts round r+1</code></pre>
+
+<p><b>A message is a hint, not a decrement.</b> It means "this task of yours might be ready now". The receiver
+always checks the log for the real answer, so a duplicated or replayed message can't make a task run too
+early or twice.</p>
+
+<p>Here is what happens when a dependency is late. <code>test</code> needs both <code>compile</code> and
+<code>lint</code>, and <code>lint</code> has to wait for <code>codegen</code>:</p>
+
+<div class="mermaid">
+flowchart LR
+    compile --> test
+    codegen --> lint --> test
+    classDef late fill:#fef3c7,stroke:#c99a12,color:#111
+    class lint late
+</div>
+
+<table>
+  <tr><th>Round</th><th>What happens</th><th><code>test</code></th></tr>
+  <tr><td>0</td><td>The sources <code>compile</code> and <code>codegen</code> run and are logged DONE.
+      <code>compile</code> sends "test?" to test's shard, and <code>codegen</code> sends "lint?" to lint's.</td>
+      <td></td></tr>
+  <tr><td>1</td><td>Test's shard checks the log: <code>compile</code> is DONE, but <code>lint</code> has no outcome.
+      At the same time, <code>lint</code> is ready (<code>codegen</code> is DONE), so it runs, is logged DONE, and
+      sends "test?" again.</td><td>not ready: dropped</td></tr>
+  <tr><td>2</td><td>Test's shard checks again: <code>compile</code> and <code>lint</code> are both DONE.</td>
+      <td><b>runs</b></td></tr>
+</table>
+
+<p>Each predecessor announces <code>test</code> once, when it finishes. Only the announcement from the
+<i>last</i> one finds everything DONE. There's no counter to keep, no waiting list, and nothing to lose in a
+crash. The rest follows from the same rule:</p>
+
+<ul>
+  <li><b>A failed predecessor</b> sends nothing and is never DONE, so everything downstream of it never runs.
+    Everything else carries on.</li>
+  <li><b>A cycle:</b> each task on it waits for another one on it, so none ever becomes ready.</li>
+  <li><b>Two predecessors finishing in the same round</b> both send "test?". The receiver reads the inbox as a set,
+    so it checks <code>test</code> once.</li>
+  <li><b>The barrier keeps everyone consistent.</b> "DONE in an <i>earlier</i> round" means no shard acts on a log
+    entry while that round is still being written, so every shard sees the same answer.</li>
+  <li><b>Memory is the frontier, not the graph.</b> A shard reads only its candidates, their predecessor lists
+    and those predecessors' outcomes, all in batches.</li>
+</ul>
+
+<h3>What runs in parallel, round by round</h3>
+
+<p>Round <i>r</i> runs every task whose last dependency finished in round <i>r</i>−1. Within a round, every shard
+works at the same time: each worker gives each of its shards its own thread, and the workers are on different
+VMs.</p>
+
+<table>
+  <tr><th rowspan="2">Round</th><th colspan="2">Worker 1 (VM 1)</th><th colspan="2">Worker 2 (VM 2)</th>
+      <th rowspan="2">Batches sent at the end of the round</th></tr>
+  <tr><th>shard 0</th><th>shard 1</th><th>shard 2</th><th>shard 3</th></tr>
+  <tr><td>0</td><td>compile</td><td>lint</td><td>fetch</td><td>notify</td>
+      <td>0 → 2: test<br/>1 → 2: test<br/>2 → 0: parse<br/>2 → 3: validate</td></tr>
+  <tr><td>1</td><td>parse</td><td>idle</td><td>test</td><td>validate</td>
+      <td>0 → 1: load<br/>2 → 3: package<br/>3 → 1: load</td></tr>
+  <tr><td>2</td><td>idle</td><td>load</td><td>idle</td><td>package</td><td>none, so the run is DONE</td></tr>
+</table>
+<p class="caption">The four shard columns run at the same time: two threads on each of two VMs.</p>
+
+<p>Every row is the six steps above, run by four shards at once. <code>test</code> runs in round 1 because both
+<code>compile</code> and <code>lint</code> were logged DONE in round 0.</p>
+
+<p>So parallelism comes at two levels: <b>across VMs</b> (workers) and <b>across shards inside a VM</b>
+(one thread per leased shard). The tasks a single shard has ready in a round run one after another on that
+shard's thread. To get more parallelism, use more shards than workers: shards are cheap, and they also spread a
+dead worker's load over several survivors.</p>
+
+<ul>
+  <li><b>Rounds = the longest dependency chain, not V.</b> Nine tasks finish in 3 rounds. A wide, shallow graph
+    with a billion edges finishes in a handful.</li>
+  <li><b>One batch per sender and receiver per round,</b> not one message per edge. In the single-JVM
+    simulation that batch is combined <code>(v, −k)</code> decrements.</li>
+</ul>
+
+<h3>No group finding across VMs</h3>
+
+<p>In one VM, the first step is a BFS that finds the independent groups. That needs the whole graph in memory,
+which is exactly what a graph too big for one VM doesn't allow. So <b>the multi-VM run never computes groups</b>,
+and it doesn't need to:</p>
+
+<ul>
+  <li><b>Independence falls out of the dependency rule.</b> Each round runs every task whose dependencies are done,
+    whatever group it's in. In the table above, groups A, B and C are never identified, yet
+    <code>compile</code>, <code>lint</code>, <code>fetch</code> and <code>notify</code> all start in round 0 on four
+    shards.</li>
+  <li><b>The shard replaces the group as the unit of parallelism.</b> It's fixed by the hash at load time, so no
+    VM has to see the graph first.</li>
+  <li><b>Failure is isolated per task, not per group.</b> A failed task skips only the tasks downstream of it.
+    Everything else keeps running, including the rest of its own group.</li>
+  <li><b>No up-front cycle check,</b> because that would mean reading the whole graph too. Tasks on a cycle, and
+    everything downstream of them, simply never become ready. They have no outcome in the log, and the report's
+    done/failed/skipped counts leave them out.</li>
+</ul>
+
+<p>Groups can still be found without one machine seeing everything. With <b>label propagation</b>, every node
+repeatedly adopts the smallest label among its neighbours, using the same rounds and combined messages. It
+takes about as many rounds as the graph's diameter, with no global BFS. The single-JVM simulation
+(<code>DistributedTopologicalExecutor</code>) uses this to place small groups whole on one partition, so they send
+no cross-partition messages. Across VMs, the shard is already fixed when the graph is loaded, so labels would only
+help if the loader sharded by component label.</p>
+
+<h3>Crashes need no checkpoints</h3>
+
+<p>A shard keeps nothing between rounds. Its candidates are in the <code>ClusterStore</code> inbox, and its
+answers are in the <code>CompletionLog</code>, which is written <i>before</i> any message about a task is sent. So
+if a worker dies, another one leases its shards and replays the round. Logged tasks aren't run again, and resent
+batches are dropped by their <code>(round, from, to)</code> key. The log is the only state that has to be
+durable.</p>
+
+<p>Putting it together:</p>
+
+<div class="mermaid">
+flowchart TB
+    subgraph VMs["Worker processes, one per VM or container"]
+        W1["Worker 1<br/>shards 0-1"]
+        W2["Worker 2<br/>shards 2-3"]
+        W3["Worker 3<br/>takes over a dead<br/>worker's shards"]
+    end
+    P["Each round, every worker:<br/>1. reads its own shards, in batches<br/>2. runs ready tasks, logs outcomes, then sends<br/>3. heartbeats leases, arrives, advances (CAS)"]
+    subgraph DB["Graph database: Apache AGE (PostgreSQL) or Neo4j"]
+        GS[("GraphStore<br/>sharded nodes, edges")]
+        CL[("CompletionLog<br/>first outcome wins")]
+        CS[("ClusterStore<br/>leases, rounds, messages")]
+    end
+    W1 --> P
+    W2 --> P
+    W3 --> P
+    P --> GS
+    P --> CL
+    P --> CS
+</div>
+<p class="caption">Multi-VM: workers never talk to each other; all shared state goes through the store.</p>
+
+<p>Each worker streams only its own shards from the database. The store enforces the cluster rules:</p>
+
+<ul>
+  <li><b>Leases on store time, not the worker's clock,</b> so clock skew can't give a shard two owners.</li>
+  <li><b>Fenced arrivals:</b> a worker presumed dead (in a GC pause, say) can't finish a round its replacement
+    now owns.</li>
+  <li><b>No coordinator:</b> advancing a round is a compare-and-set that any worker may call.</li>
+</ul>
+
+<p>Kill a worker with SIGKILL mid-task and the survivors pick up its shards. The run still finishes, with exactly
+the rounds a single process computes.</p>
+
+<pre><code>// a worker process's main; config comes from the environment (DB_URL, SHARDS, ...)
+try (AgeWorkerContext ctx = AgeWorkerContext.of(System.getenv())) {
+    NodeCodec&lt;String&gt; codec = NodeCodec.strings();
+    ClusterReport report = Worker.topological(
+            myExecutor,                  // same DistributedTopologicalExecutor subclass
+            ctx.graphStore(codec),       // sharded, read-only graph in AGE
+            ctx.completionLog(codec),    // durable outcomes
+            codec, ctx.cluster(), ctx.config()).run();
+}</code></pre>
+
+<h2>4. What changes between scales, and what doesn't</h2>
+
+<table>
+  <tr><th></th><th>Single VM, multi-threaded</th><th>Multi-VM, multi-process</th></tr>
+  <tr><td>Executor</td><td><code>TopologicalTaskExecutor</code></td>
+      <td><code>DistributedTopologicalExecutor</code> run by <code>Worker.topological</code></td></tr>
+  <tr><td>Unit of parallelism</td><td>independent group, plus ready tasks inside it</td>
+      <td>shard of nodes, per round</td></tr>
+  <tr><td>Independent groups</td><td>found up front by one BFS, O(V + E)</td>
+      <td>never computed; they run in parallel anyway, because each round runs every ready task</td></tr>
+  <tr><td>Cycle check</td><td>before anything runs</td><td>none; tasks on a cycle never become ready</td></tr>
+  <tr><td>Counters</td><td>shared <code>AtomicIntegerArray</code></td>
+      <td>none: each shard checks the log for its own nodes</td></tr>
+  <tr><td>State</td><td>in memory</td><td>completion log + cluster store in AGE or Neo4j</td></tr>
+  <tr><td>Failure</td><td>exception fails that group</td>
+      <td>task failure skips its dependants; a crash means rebuild from log and replay</td></tr>
+  <tr><td>Your code</td><td colspan="2"><b>The same <code>executeTask</code> and hooks.</b> Only the SPIs
+      (<code>GraphStore</code>, <code>CompletionLog</code>, <code>ClusterStore</code>) change.</td></tr>
+</table>
+
+<p>A middle step makes the jump safe. <code>DistributedTopologicalExecutor</code> runs the partitioned, round-based
+algorithm <i>inside one JVM</i>, with an in-memory transport. Each partition touches only its own state, so moving
+partitions onto machines swaps the transport, not the algorithm. The tests check that every scale gives the same
+answer.</p>
+
+<h2>Takeaways</h2>
+<ul>
+  <li><b>Look for independence before you look for speed.</b> Weakly connected components are free parallelism.</li>
+  <li><b>Snapshot and validate before dispatch.</b> Concurrency bugs and half-run graphs both disappear.</li>
+  <li><b>Make state derivable.</b> If the log can rebuild every counter, recovery is a replay, not a restore.</li>
+  <li><b>Let the store enforce the rules:</b> leases, fencing and compare-and-set instead of a coordinator.</li>
+</ul>
+
+<h2>Reference</h2>
+<p>Source code, design notes and tests:
+  <a href="https://github.com/deyindra/System_Design/tree/main/graphexecutor">github.com/deyindra/System_Design/tree/main/graphexecutor</a></p>
+
+</body>
+</html>
