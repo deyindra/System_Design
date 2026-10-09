@@ -1,0 +1,28 @@
+# Two shards with one streaming replica each, Redis cache, Kafka events. Values come from the environment.
+hierarchy:
+  worker-id: ${POD_ORDINAL:0}
+  shards:
+    s0:
+      url: ${HIERARCHY_S0_URL}
+      username: ${HIERARCHY_DB_USER}
+      password: ${HIERARCHY_DB_PASSWORD}
+      pool-size: 20
+      replicas:
+        - ${HIERARCHY_S0_REPLICA_URL}
+    s1:
+      url: ${HIERARCHY_S1_URL}
+      username: ${HIERARCHY_DB_USER}
+      password: ${HIERARCHY_DB_PASSWORD}
+      pool-size: 20
+      replicas:
+        - ${HIERARCHY_S1_REPLICA_URL}
+  # Whales get a shard of their own:
+  # tenants:
+  #   "3f2a...-uuid": s1
+  cache:
+    type: redis
+    redis-uri: ${REDIS_URI}
+  events:
+    type: kafka
+    kafka-bootstrap: ${KAFKA_BOOTSTRAP_SERVERS}
+    topic: hierarchy-events

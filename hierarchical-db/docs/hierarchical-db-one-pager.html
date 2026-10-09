@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Designing a Hierarchical Database System: Interview Walkthrough</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 16px; line-height: 1.55;
+         color: #222; max-width: 1180px; margin: 28px auto; padding: 0 22px; }
+  h1 { font-size: 2em; margin: 0 0 4px; }
+  h2 { font-size: 1.3em; margin: 30px 0 8px; padding-bottom: 4px; border-bottom: 2px solid #3b6fd1; color: #1d3f86; }
+  h3 { font-size: 1.05em; margin: 16px 0 6px; }
+  p, ul, ol { margin: 6px 0 10px; }
+  ul, ol { padding-left: 22px; }
+  li { margin: 3px 0; }
+  .sub { color: #666; margin: 0 0 14px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 28px; }
+  table { border-collapse: collapse; width: 100%; font-size: .93em; margin: 8px 0 12px; }
+  th, td { border: 1px solid #ddd; padding: 6px 9px; text-align: left; vertical-align: top; }
+  th { background: #f1f5fb; }
+  code { font-family: Menlo, Consolas, monospace; font-size: .86em; background: #f3f3f3; padding: 0 3px; border-radius: 3px; }
+  pre { background: #1e1e1e; color: #e6e6e6; padding: 12px 14px; border-radius: 6px; overflow-x: auto; font-size: .84em; line-height: 1.45; }
+  pre code { background: none; color: inherit; padding: 0; }
+  .mermaid { background: #fafafa; border: 1px solid #e5e5e5; border-radius: 6px; padding: 10px; margin: 10px 0; text-align: center;
+             font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; line-height: 1.2; overflow-x: auto; }
+  .mermaid svg { max-width: 100% !important; height: auto; }
+  .mermaid foreignObject { overflow: visible; }
+  .mermaid .nodeLabel, .mermaid .edgeLabel, .mermaid .cluster-label { white-space: nowrap; }
+  .box { background: #f6f9ff; border-left: 4px solid #3b6fd1; padding: 10px 14px; margin: 10px 0; }
+  .say { background: #f3fbf5; border-left: 4px solid #2f9e57; padding: 8px 14px; margin: 10px 0; }
+  .say::before { content: "Say it like this: "; font-weight: 700; color: #1f6e3d; }
+  .note { color: #555; font-size: .92em; }
+  dl.gloss { display: grid; grid-template-columns: 170px 1fr; gap: 4px 14px; margin: 6px 0; }
+  dl.gloss dt { font-weight: 700; }
+  dl.gloss dd { margin: 0; }
+  table.bits td, table.bits th { text-align: center; font-family: Menlo, Consolas, monospace; font-size: .95em; padding: 4px 8px; }
+  table.bits td:first-child, table.bits th:first-child { text-align: left; font-family: inherit; }
+  table.bits td.op { text-align: left; font-family: inherit; color: #555; }
+  .one { background: #dff3e4; font-weight: 700; }
+  .hit { background: #2f9e57; color: #fff; font-weight: 700; }
+  tr.res td { border-top: 2px solid #888; }
+</style>
+<script src="mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "neutral",
+    themeVariables: { fontSize: "16px", fontFamily: '-apple-system, "Segoe UI", Helvetica, Arial, sans-serif' },
+    flowchart: { useMaxWidth: false, nodeSpacing: 35, rankSpacing: 50, padding: 16, wrappingWidth: 400 },
+    sequence: { useMaxWidth: false, actorMargin: 50, messageMargin: 34, boxMargin: 8, width: 170,
+                actorFontSize: 16, messageFontSize: 16, noteFontSize: 15,
+                actorFontFamily: '-apple-system, Helvetica, Arial, sans-serif',
+                messageFontFamily: '-apple-system, Helvetica, Arial, sans-serif',
+                noteFontFamily: '-apple-system, Helvetica, Arial, sans-serif' },
+    er: { useMaxWidth: false, entityPadding: 14, minEntityWidth: 150, fontSize: 15 }
+  });
+</script>
+</head>
+<body>
+<h1>Designing a Hierarchical Database System</h1>
+<p class="sub">Atlassian system-design interview, 60 minutes. This is the tree store behind Confluence page trees and Jira
+Epic → Story → Sub-task. Built for heavy concurrent reads and writes. Details, SQL and Java are in
+<a href="DESIGN.md">DESIGN.md</a>.</p>
+
+<h2>0. How to spend the 60 minutes</h2>
+<table>
+<tr><th>Min</th><th>Cover</th><th>Section</th></tr>
+<tr><td>0–5</td><td>Clarify: which product, which operations, consistency, multi-tenancy</td><td>§2</td></tr>
+<tr><td>5–10</td><td>Scale estimates, read/write ratio, depth limit</td><td>§2</td></tr>
+<tr><td>10–20</td><td>Compare the four tree models, pick one, data model with example rows</td><td>§3, §4</td></tr>
+<tr><td>20–30</td><td>API and high-level design</td><td>§5, §6</td></tr>
+<tr><td>30–45</td><td><b>Deep dive:</b> concurrency, the two races, small and large moves</td><td>§7</td></tr>
+<tr><td>45–52</td><td>Scaling reads: replicas with a read token, versioned cache</td><td>§8</td></tr>
+<tr><td>52–60</td><td>Sharding, failure modes, trade-offs, follow-up questions</td><td>§9</td></tr>
+</table>
+
+<h2>1. Executive overview</h2>
+<table>
+<tr><th>Decision</th><th>What we do</th><th>Why</th></tr>
+<tr><td>How the tree is stored</td><td>Every row stores its <b>parent_id</b> (the truth) and its <b>path</b> of ancestor ids
+  <code>/100/104/101/</code> (a read index)</td><td>Breadcrumbs become one lookup and a subtree becomes one index range
+  scan. The only cost is that a move rewrites the subtree's paths</td></tr>
+<tr><td>Where it lives</td><td>Postgres, sharded by tenant. One space sits on one shard</td><td>Every operation is one
+  short ACID transaction on one database</td></tr>
+<tr><td>How concurrency is safe</td><td>A per-space lock: <b>shared</b> for creates, <b>exclusive</b> for moves. Edits use
+  OCC (a version number). A large move uses a <b>path-rewrite overlay</b> and finishes in the background</td>
+  <td>Thousands of creates run in parallel. Moves can't corrupt the tree or create cycles. Readers are never blocked</td></tr>
+<tr><td>How reads scale</td><td>Async replicas with a read-your-writes token, plus Redis keys that carry a
+  <code>tree_version</code></td><td>Handles 500k reads/s. One counter bump invalidates every breadcrumb in a space</td></tr>
+</table>
+<div class="say">"I keep the parent pointer as the truth and a materialized path as the index, so the hot reads are one index
+operation. The hard part is moves, so I serialize them per space and use an overlay for big ones. Everything else runs
+concurrently."</div>
+<dl class="gloss">
+<dt>Space / tree</dt><dd>A Confluence space or Jira project: one root and its descendants. The unit that moves are
+  serialized on.</dd>
+<dt>Adjacency list</dt><dd>Each row points to its parent (<code>parent_id</code>).</dd>
+<dt>Materialized path</dt><dd>Each row stores the ids from the root down to itself, e.g. <code>/100/104/101/</code>. A
+  subtree is every row whose path starts with a given prefix.</dd>
+<dt>Breadcrumb</dt><dd>The ancestors from the root down to the node: <i>Engineering › Runbooks › Architecture</i>.</dd>
+<dt>Keyset pagination</dt><dd>"Give me 50 rows after this key" instead of <code>OFFSET</code>. It's fast and stable while
+  rows are being inserted.</dd>
+<dt>LexoRank</dt><dd>Jira's sibling order. A position is a string, and inserting between two siblings picks a string
+  between theirs, so no other rows change.</dd>
+<dt>Advisory lock</dt><dd>A named in-memory Postgres lock, held until commit, available in shared or exclusive mode.</dd>
+<dt>OCC</dt><dd>Optimistic concurrency control: <code>UPDATE … WHERE version = 7</code>. Zero rows updated means someone
+  else changed the row first.</dd>
+<dt>Overlay</dt><dd>A one-row rule, "paths starting with <i>old</i> really start with <i>new</i>", that readers apply
+  while a large move's rows are still being rewritten.</dd>
+<dt>LSN read token</dt><dd>The WAL position of your last write. A replica serves you only once it has replayed that far.</dd>
+</dl>
+
+<h2>2. Requirements and scale</h2>
+<div class="grid2">
+<div>
+<h3>Functional</h3>
+<ul>
+<li>Create, get, rename and edit nodes</li>
+<li><b>Children</b>: paged, in user-defined order (lazy tree loading)</li>
+<li><b>Breadcrumbs</b>: root to node, shown on every page view</li>
+<li><b>Subtree</b>: optionally limited to depth N (sidebar, export, audits)</li>
+<li><b>Move</b> a subtree without ever creating a cycle; <b>reorder</b> among siblings</li>
+<li>Trash, restore and purge a subtree</li>
+<li>Inherited restrictions: a view restriction on an ancestor hides the whole subtree</li>
+</ul>
+<h3>Non-functional</h3>
+<ul>
+<li>About 25 reads per write. p99 under 20 ms for get, children and breadcrumbs</li>
+<li>Strong consistency for structure: no cycles, orphans or nodes in two places. A writer always sees their own writes</li>
+<li>Thousands of concurrent creates in one space. Concurrent moves from many admins</li>
+<li>Strict tenant isolation. 99.95% availability. RPO 0</li>
+</ul>
+</div>
+<div>
+<h3>Numbers</h3>
+<table>
+<tr><th>Item</th><th>Value</th></tr>
+<tr><td>Tenants, nodes</td><td>300k tenants, <b>5 B</b> nodes</td></tr>
+<tr><td>Largest space</td><td>1 M nodes</td></tr>
+<tr><td>Depth</td><td>3–8 typical, <b>hard limit 64</b>. This keeps the path under Postgres's 2.7 KB B-tree entry limit</td></tr>
+<tr><td>Peak QPS</td><td>500k reads, 20k writes, ~50 moves</td></tr>
+<tr><td>Row size</td><td>~300 B, so 1.5 TB, ×2 with indexes = <b>3 TB</b>. Bodies are stored separately</td></tr>
+<tr><td>Shards</td><td>32 × (primary + sync standby + 2 replicas). ~100 GB each, which fits in RAM</td></tr>
+<tr><td>Per shard</td><td>~600 writes/s, and ~4.7k database reads/s after a 70% cache hit rate</td></tr>
+</table>
+</div>
+</div>
+
+<h2>3. Choosing the tree model (the first big decision)</h2>
+<table>
+<tr><th>Model</th><th>Ancestors</th><th>Subtree</th><th>Move</th><th>Insert</th><th>Verdict</th></tr>
+<tr><td>Adjacency list <code>parent_id</code></td><td>recursive CTE</td><td>recursive CTE, no index range</td><td><b>O(1)</b></td><td>O(1)</td><td>Keep as the truth</td></tr>
+<tr><td>Materialized path <code>/1/4/12/</code></td><td><b>one PK multi-get</b></td><td><b>one range scan</b></td><td>O(subtree)</td><td>O(1)</td><td><b>Keep as the index</b></td></tr>
+<tr><td>Nested sets <code>lft, rgt</code></td><td>range</td><td>range</td><td>O(tree)</td><td><b>O(tree)</b></td><td>No: each insert renumbers half the tree</td></tr>
+<tr><td>Closure table</td><td>join</td><td>join</td><td>O(subtree × depth)</td><td>O(depth)</td><td>No: ~30 B extra rows and heavy write amplification</td></tr>
+<tr><td>Graph database</td><td>traversal</td><td>traversal</td><td>O(1)</td><td>O(1)</td><td>No: a second system of record with no tenant-sharding story</td></tr>
+</table>
+<div class="say">"Reads outnumber moves by about 10,000 to 1, so I make reads O(1) and pay on moves. Then I spend the deep
+dive making moves cheap and safe."</div>
+
+<h2>4. Data model (inside each shard)</h2>
+<div class="mermaid">
+erDiagram
+    SPACES ||--o{ NODES : contains
+    NODES ||--o{ NODES : "parent_id"
+    NODES ||--|| NODE_CONTENT : body
+    NODES ||--o{ RESTRICTIONS : "restricted by"
+    SPACES ||--o{ MOVE_JOBS : "active overlay"
+    SPACES {
+        uuid tenant_id PK
+        bigint space_id PK
+        bigint root_node_id
+        bigint tree_version
+    }
+    NODES {
+        uuid tenant_id PK
+        bigint node_id PK
+        bigint space_id
+        bigint parent_id
+        text path "ancestors then self"
+        smallint depth
+        text rank "LexoRank"
+        text title
+        text status
+        int version "OCC"
+    }
+    NODE_CONTENT {
+        uuid tenant_id PK
+        bigint node_id PK
+        text body
+    }
+    RESTRICTIONS {
+        uuid tenant_id PK
+        bigint node_id PK
+        text op PK
+        text principal PK
+    }
+    MOVE_JOBS {
+        uuid tenant_id PK
+        bigint job_id PK
+        text old_prefix
+        text new_prefix
+        smallint depth_delta
+        text state
+    }
+</div>
+<p class="note">Also in each shard: <code>outbox</code> (events) and <code>idempotency_keys</code>.</p>
+<div class="grid2">
+<div>
+<pre><code>CREATE TABLE nodes (
+  tenant_id uuid, node_id bigint,      -- Snowflake id
+  space_id bigint, parent_id bigint,
+  path  text COLLATE "C" NOT NULL,     -- '/100/104/101/'
+  depth smallint CHECK (depth &lt; 64),
+  rank  text COLLATE "C" NOT NULL,     -- sibling order
+  node_type text, title text,
+  status text DEFAULT 'ACTIVE',        -- or TRASHED
+  version int DEFAULT 1,               -- OCC
+  PRIMARY KEY (tenant_id, node_id));
+
+-- children, keyset-paged
+CREATE INDEX ix_nodes_children
+  ON nodes (tenant_id, parent_id, rank, node_id);
+-- subtree = prefix range scan
+CREATE INDEX ix_nodes_path
+  ON nodes (tenant_id, path);</code></pre>
+</div>
+<div>
+<ul>
+<li><b><code>tenant_id</code> leads every key:</b> isolation, locality, and a tenant can be moved to another shard as a unit.</li>
+<li><b>The path holds ids, not titles:</b> a rename touches one row.</li>
+<li><b>The trailing <code>/</code></b> stops <code>/1/2</code> from matching <code>/1/23/</code>.</li>
+<li><b><code>COLLATE "C"</code></b> makes <code>LIKE 'p%'</code> a plain B-tree range (verified on Postgres 16).</li>
+<li><b>No <code>child_count</code> on the parent:</b> that row would be a hot spot that every concurrent create waits on.</li>
+<li><b>The body is in its own table,</b> so the tree row stays small and cache-friendly.</li>
+<li><b>Snowflake ids</b> stay valid when a tenant moves to another shard.</li>
+</ul>
+</div>
+</div>
+<h3>Example: space ENG, then "move Architecture (101) under Runbooks (104)"</h3>
+<div class="grid2">
+<table>
+<tr><th>id</th><th>parent</th><th>path (before)</th><th>depth</th><th>title</th></tr>
+<tr><td>100</td><td>–</td><td><code>/100/</code></td><td>0</td><td>Engineering</td></tr>
+<tr><td>101</td><td>100</td><td><code>/100/101/</code></td><td>1</td><td>Architecture</td></tr>
+<tr><td>102</td><td>101</td><td><code>/100/101/102/</code></td><td>2</td><td>ADR-001</td></tr>
+<tr><td>103</td><td>101</td><td><code>/100/101/103/</code></td><td>2</td><td>ADR-002</td></tr>
+<tr><td>104</td><td>100</td><td><code>/100/104/</code></td><td>1</td><td>Runbooks</td></tr>
+<tr><td>105</td><td>104</td><td><code>/100/104/105/</code></td><td>2</td><td>On-call</td></tr>
+</table>
+<table>
+<tr><th>id</th><th>parent</th><th>path (after)</th><th>depth</th><th>changed?</th></tr>
+<tr><td>101</td><td class="one">104</td><td class="one"><code>/100/104/101/</code></td><td>2</td><td>root: parent, path, depth</td></tr>
+<tr><td>102</td><td>101</td><td class="one"><code>/100/104/101/102/</code></td><td>3</td><td>path prefix only</td></tr>
+<tr><td>103</td><td>101</td><td class="one"><code>/100/104/101/103/</code></td><td>3</td><td>path prefix only</td></tr>
+<tr><td>100, 104, 105</td><td>–</td><td>unchanged</td><td>–</td><td>not under <code>/100/101/</code></td></tr>
+</table>
+</div>
+
+<h2>5. API</h2>
+<table>
+<tr><th>Call</th><th>What it does</th><th>Key details</th></tr>
+<tr><td><code>POST /v1/spaces/{s}/nodes</code></td><td>Create under a parent</td><td><code>Idempotency-Key</code>. Returns <code>ETag</code> and <code>X-Read-Token</code></td></tr>
+<tr><td><code>GET /v1/nodes/{id}/children?cursor=</code></td><td>Children in rank order</td><td>Keyset cursor <code>(rank, node_id)</code>, never <code>OFFSET</code></td></tr>
+<tr><td><code>GET /v1/nodes/{id}/ancestors</code></td><td>Breadcrumbs</td><td>One primary-key multi-get of the path ids</td></tr>
+<tr><td><code>GET /v1/nodes/{id}/descendants?depth=3</code></td><td>Subtree, depth-first order</td><td>Cursor = the last path returned</td></tr>
+<tr><td><code>PATCH /v1/nodes/{id}</code></td><td>Rename or edit</td><td><code>If-Match: "v7"</code>, else <code>412</code></td></tr>
+<tr><td><code>POST /v1/nodes/{id}/move</code></td><td>Move or reorder</td><td>Returns <code>200</code> for a small move, <code>202 {jobId}</code> for a large one, <code>409</code> on a cycle, the depth limit or a move already running</td></tr>
+<tr><td><code>POST /v1/nodes/{id}/trash</code></td><td>Trash or restore a subtree</td><td>O(1): one row changes</td></tr>
+</table>
+
+<h2>6. High-level design</h2>
+<div class="mermaid">
+flowchart TB
+    C[Browser, Jira and Confluence services] --> GW[Envoy gateway: auth, tenant routing, rate limits]
+    GW --> TS[Tree Service: stateless pods]
+    TS --> RC[(Redis: breadcrumbs, children page 1, titles)]
+    TS --> PB[PgBouncer per shard]
+    PB --> P[(Postgres primary, sharded by tenant)]
+    P -->|sync| S[(Sync standby: RPO 0)]
+    P -->|async| R[(Read replicas)]
+    TS -->|reads with a read token| R
+    P --> OB[Outbox relay]
+    OB --> K[[Kafka: tree-events]]
+    K --> MW[Move workers: batched path rewrite]
+    K --> CI[Cache invalidator]
+    K --> SE[Search, audit, webhooks]
+    MW --> PB
+</div>
+<div class="grid2">
+<div>
+<h3>Read flows</h3>
+<ul>
+<li><b>Breadcrumbs:</b> split the path into ids, then <code>WHERE node_id = ANY(ids)</code>. At depth 8 that's 8 PK probes in one round trip.</li>
+<li><b>Children:</b> <code>WHERE parent_id = ? AND (rank, id) &gt; cursor ORDER BY rank, id LIMIT 50</code>.</li>
+<li><b>Subtree:</b> <code>WHERE path &gt; '/100/' AND path &lt; '/1000' AND depth &lt;= d</code>. Path order is depth-first order.</li>
+<li><b>Permissions:</b> fetch <code>restrictions</code> for the path ids. The viewer must pass every restricted ancestor.</li>
+<li><b>Trashed?</b> Any ancestor on the path is TRASHED, so trash is O(1).</li>
+</ul>
+</div>
+<div>
+<h3>Write flows</h3>
+<ul>
+<li><b>Create:</b> shared space lock, read the parent's path, insert with path = parent path + id, write the outbox. One transaction, about 2 ms.</li>
+<li><b>Rename or edit:</b> <code>UPDATE … WHERE version = ?</code>. No tree lock.</li>
+<li><b>Reorder:</b> new rank = <code>LexoRank.between(prev, next)</code>. One row changes.</li>
+<li><b>Move:</b> exclusive space lock, cycle check, then a small move or a large move (§7).</li>
+<li><b>Events:</b> outbox → Kafka feeds search, audit, cache invalidation and move jobs, with no dual writes.</li>
+</ul>
+</div>
+</div>
+
+<h2>7. Deep dive: concurrency and moves</h2>
+<h3>7.1 The lock matrix</h3>
+<table>
+<tr><th>Operation</th><th>Per-space advisory lock</th><th>Other protection</th><th>Held for</th></tr>
+<tr><td>Create</td><td class="one">shared</td><td>idempotency key</td><td>~2 ms</td></tr>
+<tr><td>Rename, edit, reorder, trash</td><td>none</td><td>OCC <code>version</code></td><td>~1 ms</td></tr>
+<tr><td>Move ≤ 10k descendants</td><td class="hit">exclusive</td><td>cycle check under the lock</td><td>5–150 ms</td></tr>
+<tr><td>Large move: accept / finish</td><td class="hit">exclusive</td><td>one running job per space (unique index)</td><td>~5 ms</td></tr>
+<tr><td>Large move: each batch</td><td>none</td><td>row locks, <code>SKIP LOCKED</code></td><td>~20 ms</td></tr>
+</table>
+<p>Shared locks never block each other, so 10k parallel creates in one space don't wait. Moves in different spaces run in
+parallel. A cross-space move locks both spaces in id order, so there's no deadlock. Every transaction sets
+<code>lock_timeout = 2s</code>, and a timeout returns <code>409 Retry-After</code>.</p>
+
+<h3>7.2 Race 1: create vs move (why creates need the shared lock)</h3>
+<div class="mermaid">
+sequenceDiagram
+    participant T1 as T1: create X under B
+    participant DB as Postgres
+    participant T2 as T2: move A (B is inside A)
+    T1->>DB: read B.path = /r/A/B/ (old)
+    T2->>DB: UPDATE rows LIKE '/r/A/%' (snapshot taken now)
+    T1->>DB: INSERT X with path /r/A/B/X/, COMMIT
+    T2->>DB: COMMIT (X was not in its snapshot)
+    Note over DB: X keeps the old prefix and is lost from the tree
+</div>
+<div class="say">"In Read Committed, an UPDATE only re-checks rows it already saw, so a concurrently inserted child is
+missed. A row lock on the parent fixes only one of the two orderings. A shared/exclusive lock per space fixes both,
+and it costs creates nothing because moves are rare and short."</div>
+
+<h3>7.3 Race 2: move vs move (concurrent cycle)</h3>
+<p>Admin 1 moves A under B while admin 2 moves B under A. Each cycle check passes on its own snapshot, and together they
+create a loop. The <b>exclusive lock serializes moves</b>, so the second move sees the first and returns a
+<code>409</code> cycle error. The cycle check itself is one string test: <code>newParent.path.startsWith(node.path)</code>.</p>
+
+<div class="grid2">
+<div>
+<h3>7.4 Small move (≤ 10k rows): one statement</h3>
+<pre><code>UPDATE nodes
+SET path  = :new || substr(path, length(:old)+1),
+    depth = depth + :delta
+WHERE tenant_id = :t
+  AND path LIKE :old || '%';
+UPDATE nodes SET parent_id = :p, rank = :rank
+WHERE tenant_id = :t AND node_id = :id;</code></pre>
+<p class="note">Size is checked first with a <code>LIMIT 10001</code> probe. 10k rows is about 3 MB of WAL, well under
+200 ms.</p>
+</div>
+<div>
+<h3>7.5 Large move (&gt; 10k rows): overlay plus background rewrite</h3>
+<ol>
+<li><b>Accept (~5 ms, exclusive lock):</b> update the root, insert
+  <code>move_jobs(old → new, RUNNING)</code>, bump <code>tree_version</code>. Return <code>202</code>.</li>
+<li><b>Readers translate</b> any path starting with <i>old</i> into <i>new</i>, so the tree <b>looks fully moved
+  immediately</b>.</li>
+<li><b>Workers rewrite 1,000 rows per transaction</b> with no tree lock, pausing if replicas lag. Rewritten rows
+  leave the range, so a crashed job simply resumes.</li>
+<li><b>Finish (~2 ms, exclusive lock):</b> no rows are left, so mark the job DONE and bump
+  <code>tree_version</code>.</li>
+</ol>
+<p class="note">New children are created from the parent's <i>translated</i> path, so they're correct from the start.
+While a job is running, another move in the same space gets <code>409 Retry-After</code>. Large moves stay inside
+one space. The worker starts on the <code>MOVE_STARTED</code> event and holds the job with a lease, which a sweep on
+any pod reclaims if that worker dies.</p>
+</div>
+</div>
+<div class="mermaid">
+sequenceDiagram
+    participant U as Admin
+    participant TS as Tree Service
+    participant DB as Postgres shard
+    participant W as Move worker
+    U->>TS: POST /nodes/101/move to 104
+    TS->>DB: lock, cycle check, size > 10k
+    TS->>DB: update root + move_jobs RUNNING
+    TS-->>U: 202 jobId (already looks moved)
+    DB-->>W: MOVE_STARTED via Kafka
+    loop until 0 rows remain
+        W->>DB: rewrite 1,000 rows
+    end
+    W->>DB: lock, job DONE
+</div>
+
+<h3>7.6 Sibling order without a parent lock: LexoRank</h3>
+<p>To insert between ranks <code>a5</code> and <code>b</code>, use <code>ak</code>. To append after <code>i</code>, use
+<code>r</code>. Only one row changes. Two concurrent inserts at the same spot may get the same rank, and that's fine
+because the index orders by <code>(rank, node_id)</code>. When ranks under a parent grow past 32 characters, a
+background job respaces that parent's children.</p>
+
+<h2>8. Scaling reads</h2>
+<div class="grid2">
+<div>
+<h3>Replicas with read-your-writes</h3>
+<ul>
+<li>Every write returns <code>X-Read-Token</code>, which is its commit LSN.</li>
+<li>The router sends a read to a replica whose replayed LSN is at least the token, otherwise to the primary. Lag is
+  usually milliseconds, so the fallback is rare.</li>
+<li>Readers without a token use any replica with less than 1 s of lag.</li>
+<li>Strict reads always go to the primary: move pre-flight, create validation and OCC.</li>
+</ul>
+</div>
+<div>
+<h3>Redis with versioned keys</h3>
+<table>
+<tr><th>Key</th><th>Invalidated by</th></tr>
+<tr><td><code>bc:{t}:{space}:{tree_version}:{node}</code> ancestor ids</td><td>a move bumps <code>tree_version</code></td></tr>
+<tr><td><code>ch:{t}:{parent}:{tree_version}</code> children page 1</td><td>DEL on create, reorder or trash under that parent</td></tr>
+<tr><td><code>ti:{t}:{node}</code> title, version</td><td>DEL on rename</td></tr>
+</table>
+<p class="note">Breadcrumbs store ids, not titles, so a rename invalidates one key. Readers holding a read token newer
+than the last move skip the cache.</p>
+</div>
+</div>
+
+<h2>9. Sharding, failures and trade-offs</h2>
+<div class="grid2">
+<div>
+<h3>Sharding</h3>
+<ul>
+<li>Shard by <code>tenant_id</code>. A space never spans shards, so every move is a single-shard transaction.</li>
+<li>The tenant → shard map is cached in pods. A tenant is rebalanced with logical replication, a short write fence,
+  then a map flip.</li>
+<li>Tenants with more than 50M nodes get a dedicated shard.</li>
+<li>Spanner or CockroachDB only if a tenant must be writable in several regions at once.</li>
+</ul>
+<h3>Failure modes</h3>
+<table>
+<tr><th>Failure</th><th>Handling</th></tr>
+<tr><td>Primary dies</td><td>Patroni promotes the sync standby (RPO 0, under 30 s). Retries reuse the idempotency key</td></tr>
+<tr><td>Replica lags</td><td>The router drops it. Token holders use the primary</td></tr>
+<tr><td>Redis down</td><td>Reads go to replicas. Correctness is unaffected</td></tr>
+<tr><td>Move worker crashes</td><td>The overlay keeps reads correct. Another pod claims the job when its lease expires</td></tr>
+<tr><td>Path drift (a bug)</td><td>A nightly verifier rebuilds paths from <code>parent_id</code> with a recursive CTE</td></tr>
+</table>
+</div>
+<div>
+<h3>Follow-up questions to expect</h3>
+<div class="box"><b>"Why not a closure table?"</b> It makes arbitrary ancestor joins easy, but it stores N × depth rows
+(about 30 B here), and a move deletes and inserts subtree × depth rows. A path gives the same reads more cheaply.</div>
+<div class="box"><b>"Why not Neo4j?"</b> A tree with tenant-scoped prefix queries doesn't need graph traversal, and it
+would add a second source of truth with no tenant sharding. Jira issue <i>links</i> do form a graph, and that's a
+separate service.</div>
+<div class="box"><b>"What if a move touches 1M pages?"</b> The overlay commits in milliseconds, and the background rewrite
+takes about a minute, throttled on replica lag. Readers never see a half-moved tree.</div>
+<div class="box"><b>"Hot parent with 10k children created at once?"</b> There's no parent row update and no parent lock.
+The space lock is shared, ranks can tie, and <code>node_id</code> breaks ties.</div>
+<div class="box"><b>"Jira's fixed levels?"</b> <code>node_type</code> plus a rules table (a sub-task only under a story)
+is checked at create and move time.</div>
+</div>
+</div>
+</body>
+</html>

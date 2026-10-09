@@ -1,0 +1,61 @@
+spring:
+  application:
+    name: hierarchy
+  jackson:
+    default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false
+  mvc:
+    problemdetails:
+      enabled: true
+  task:
+    scheduling:
+      pool:
+        size: 4          # relay, replica probe, move sweep, prune: none of them may starve the others
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+
+server:
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: hierarchy
+
+# Local defaults: one Postgres shard (docker run postgres:16-alpine), no cache, in-process events.
+hierarchy:
+  worker-id: 0
+  lock-timeout: 2s
+  shards:
+    s0:
+      url: jdbc:postgresql://localhost:5432/hierarchy
+      username: hierarchy
+      password: hierarchy
+      pool-size: 10
+  move:
+    sync-limit: 10000
+    batch-size: 1000
+    worker-enabled: true
+    sweep-interval-ms: 1000
+    lease: 30s
+    max-replica-lag: 1s
+  relay:
+    enabled: true
+    interval-ms: 50
+  replicas:
+    probe-interval-ms: 20
+    max-lag: 1s
+  cache:
+    type: none           # none | redis
+  events:
+    type: inprocess      # inprocess | kafka
