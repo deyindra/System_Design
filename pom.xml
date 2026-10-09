@@ -15,6 +15,7 @@
         <module>webcrawler</module>
         <module>taskabstraction</module>
         <module>graphexecutor</module>
+        <module>hierarchical-db</module>
     </modules>
 
     <properties>

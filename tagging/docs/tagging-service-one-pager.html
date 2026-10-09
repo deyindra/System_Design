@@ -359,8 +359,9 @@ sequenceDiagram
 <div class="mermaid">
 erDiagram
   TAGS ||--o{ ENTITY_TAGS : "tag_id"
-  ENTITIES ||--o{ ENTITY_TAGS : "item"
+  ENTITIES ||--o{ ENTITY_TAGS : "type + id (seq copied)"
   TAGS ||--|{ TAG_USAGE : "counts"
+  ENTITY_TAGS ||--|| IX_ENTITY_TAGS_BY_TAG : "same rows, sorted by tag"
   TAGS {
     varchar tenant_id PK
     bigint tag_id PK
@@ -380,7 +381,7 @@ erDiagram
     varchar entity_type PK
     varchar entity_id PK
     bigint tag_id PK
-    bigint entity_seq
+    bigint entity_seq "copy of ENTITIES.entity_seq"
   }
   TAG_USAGE {
     varchar tenant_id PK
@@ -393,7 +394,17 @@ erDiagram
     varchar tenant_id
     text payload "the event"
   }
+  IX_ENTITY_TAGS_BY_TAG {
+    varchar tenant_id "key 1"
+    bigint tag_id "key 2"
+    bigint entity_seq "key 3"
+  }
 </div>
+<p class="note">The <code>IX_ENTITY_TAGS_BY_TAG</code> box is not a table. It is the <b>inverted index stored in the database</b>: a B-tree
+index on <code>entity_tags</code> (<code>CREATE INDEX ix_entity_tags_by_tag ON entity_tags (tenant_id, tag_id,
+entity_seq)</code>). PostgreSQL keeps it in the shard, on disk, and updates it in the same transaction as every link.
+The other inverted index, the RoaringBitmaps, is <b>not</b> stored in the database. It lives only in pod memory and
+is rebuilt from this index's table (§6.4).</p>
 <div class="grid2">
 <div>
 <table>
@@ -404,11 +415,15 @@ erDiagram
       is its bit position in the search bitmaps (§6). Its row is also locked while tagging, which makes the 100-tag
       limit exact.</td></tr>
   <tr><td><code>entity_tags</code></td><td>item–tag link (20 B rows)</td><td>The core table. It stores <code>tag_id</code>,
-      not the name, so renaming a tag used 10M times changes one row.</td></tr>
+      not the name, so renaming a tag used 10M times changes one row. It also carries a <b>copy</b> of the item's
+      <code>entity_seq</code> (see the box below).</td></tr>
   <tr><td><code>tag_usage</code></td><td>tag × 16 buckets</td><td>Usage counts, split into 16 rows so a popular tag isn't
       one hot row that every write fights over.</td></tr>
   <tr><td><code>outbox</code></td><td>change</td><td>The event for each change, written in the same transaction, so data
       and event can never disagree. Its <code>seq</code> numbers the shard's changes in order.</td></tr>
+  <tr><td><code>ix_entity_tags_by_tag</code><br/><i>(index, not a table)</i></td><td>link, sorted by tag</td><td>The
+      <b>inverted index in the database</b>: tag → items, in item-number order. It serves "items with tag T" pages
+      and the SQL fallback for search.</td></tr>
 </table>
 </div>
 <div>
@@ -418,6 +433,22 @@ erDiagram
     tag used 10M times returns instantly.</li>
   <li><b>No foreign keys:</b> they would lock the tag row on every attach. The transaction checks that the tag exists instead.</li>
 </ul>
+<div class="box"><b>Why <code>entity_seq</code> is in both tables (a deliberate copy).</b>
+<code>entities</code> <i>owns</i> the number: it assigns it once, when the item is first tagged.
+<code>entity_tags</code> keeps a copy on every link so that:
+<ul>
+  <li>the inverted index <code>(tenant_id, tag_id, entity_seq)</code> can be built on this table and sorts a tag's items by
+    number, so pages need no join and no sort;</li>
+  <li>a page of "items with tag T" returns <code>entity_type, entity_id</code> straight from the same rows;</li>
+  <li>the bitmaps can be bootstrapped with a single scan of <code>entity_tags</code>.</li>
+</ul>
+<b>Why the copy can't drift:</b> the number never changes and is never reused (no code updates or deletes an
+<code>entities</code> row). Every attach first reads the number under the item's row lock, then writes it into the new
+link, in the same transaction.
+<br/><b>The normalized alternative:</b> key <code>entity_tags</code> by <code>(tenant_id, entity_seq, tag_id)</code> and drop the
+string ids from it. That saves ~35 B per link (~0.7 TB across 20 B links), but the hot "tags of an item" call (285k/s)
+would need an extra lookup in <code>entities</code> first, and every page would join back to it.</div>
+
 </div>
 </div>
 
